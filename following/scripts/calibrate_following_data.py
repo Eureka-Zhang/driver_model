@@ -2,29 +2,39 @@
 """
 Calibrate following (跟驰) driving_data.csv trajectories.
 
-- Longitudinal: keep ego_pos_x and all lead / headway columns unchanged.
+- Longitudinal: keep ego_pos_x and all lead / headway columns unchanged, but clean
+  ego_acceleration for modeling:
+      median filter -> moving average -> clip to [-8, 6] m/s^2 by default.
+  relative_speed is rewritten consistently as relative_v_long = lead_v_long - ego_v_long.
+- Decomposed kinematics are added for longitudinal car-following modeling:
+      ego_v_long, ego_v_lat, ego_a_long, ego_a_lat,
+      lead_v_long, lead_v_lat, relative_v_long.
+  For this straight-road dataset, long/lat are approximated by x/y derivatives.
 - Lateral: ego_pos_y is pulled toward the right-lane centerline:
       y_new = y_center + lateral_scale * (y_raw - y_center)
   Default lateral_scale=0.5 reduces lateral oscillation; y_center matches right lane mid (~ -7.625 m).
 
 - Safe defaults:
-      only calibrate ego_pos_y; preserve ego_speed / ego_acceleration / ego_jerk / ego_yaw / steer.
+      calibrate ego_pos_y; preserve ego_speed / ego_yaw / steer; compute decomposed x/y
+      velocities and accelerations; set ego_acceleration to cleaned ego_a_long.
+      ego_jerk is recomputed from the cleaned acceleration for later comfort analysis,
+      but should not be used as a training input/output target.
   Direct high-order differencing of quantized simulator positions can create large spikes, so
   recomputing kinematics is opt-in via --kinematics_mode recompute.
 - steer: default copies original steer. Optional Ackermann-style estimate is available via
   --steer_mode bicycle and is low-pass filtered.
 
-Does not modify: lead_*, distance_headway, time_headway, relative_speed, ttc, throttle, brake,
+Does not modify: lead_*, distance_headway, time_headway, ttc, throttle, brake,
 longitudinal_control, control_mode, gear, lead_behavior_mode, real_world_* , frame.
 
 python3 /home/zwx/driver_model/scripts/calibrate_following_data.py \
   --data_dir /home/zwx/driver_model/data \
   --out_dir /home/zwx/driver_model/outputs/following_calibrated \
-  --yaw_mode path \
-  --steer_mode bicycle \
   --kinematics_mode preserve \
-  --y_smooth_window 9 \
-  --steer_smooth_window 21
+  --acc_median_window 5 \
+  --acc_smooth_window 7 \
+  --acc_clip_min -8 \
+  --acc_clip_max 6
 """
 from __future__ import print_function
 
@@ -78,6 +88,59 @@ def _moving_average(values, window):
         hi = min(n, i + half + 1)
         out.append(sum(values[lo:hi]) / float(hi - lo))
     return out
+
+
+def _median_filter(values, window):
+    """Centered median filter with edge truncation; window<=1 means no filtering."""
+    if window <= 1 or not values:
+        return list(values)
+    if window % 2 == 0:
+        window += 1
+    half = window // 2
+    out = []
+    n = len(values)
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        vals = sorted(values[lo:hi])
+        out.append(vals[len(vals) // 2])
+    return out
+
+
+def _clip(values, lo, hi):
+    return [max(lo, min(hi, v)) for v in values]
+
+
+def _derivative(ts, values):
+    """Central finite difference of a scalar signal."""
+    n = len(values)
+    out = [0.0] * n
+    if n <= 1:
+        return out
+    for i in range(n):
+        if i == 0:
+            dt = ts[1] - ts[0]
+            if dt <= 0:
+                dt = 1e-6
+            out[i] = (values[1] - values[0]) / dt
+        elif i == n - 1:
+            dt = ts[n - 1] - ts[n - 2]
+            if dt <= 0:
+                dt = 1e-6
+            out[i] = (values[n - 1] - values[n - 2]) / dt
+        else:
+            dt = ts[i + 1] - ts[i - 1]
+            if dt <= 0:
+                dt = 1e-6
+            out[i] = (values[i + 1] - values[i - 1]) / dt
+    return out
+
+
+def _clean_acceleration(values, median_window, smooth_window, clip_min, clip_max):
+    values = _median_filter(values, median_window)
+    values = _moving_average(values, smooth_window)
+    values = _clip(values, clip_min, clip_max)
+    return values
 
 
 def _finite_diff_vx_vy(ts, xs, ys, n):
@@ -181,6 +244,10 @@ def calibrate_rows(
     y_center,
     lateral_scale,
     y_smooth_window,
+    acc_median_window,
+    acc_smooth_window,
+    acc_clip_min,
+    acc_clip_max,
     kinematics_mode,
     yaw_mode,
     wheelbase,
@@ -199,13 +266,40 @@ def calibrate_rows(
     ts = []
     xs = []
     ys_raw = []
+    lead_xs = []
+    lead_ys = []
     for r in rows_dicts:
         ts.append(_parse_float(r.get("timestamp"), 0.0))
         xs.append(_parse_float(r.get("ego_pos_x"), 0.0))
         ys_raw.append(_parse_float(r.get("ego_pos_y"), 0.0))
+        lead_xs.append(_parse_float(r.get("lead_pos_x"), 0.0))
+        lead_ys.append(_parse_float(r.get("lead_pos_y"), 0.0))
 
     ys = [y_center + lateral_scale * (y - y_center) for y in ys_raw]
     ys = _moving_average(ys, y_smooth_window)
+
+    # Straight-road decomposition: x is longitudinal, y is lateral.
+    # Smooth positions lightly before differentiation to avoid amplifying quantization noise.
+    xs_for_diff = _moving_average(xs, 3)
+    ys_for_diff = _moving_average(ys, 3)
+    lead_xs_for_diff = _moving_average(lead_xs, 3)
+    lead_ys_for_diff = _moving_average(lead_ys, 3)
+    ego_v_long = _derivative(ts, xs_for_diff)
+    ego_v_lat = _derivative(ts, ys_for_diff)
+    lead_v_long = _derivative(ts, lead_xs_for_diff)
+    lead_v_lat = _derivative(ts, lead_ys_for_diff)
+    ego_a_long = _derivative(ts, ego_v_long)
+    ego_a_lat = _derivative(ts, ego_v_lat)
+    lead_a_long = _derivative(ts, lead_v_long)
+    lead_a_lat = _derivative(ts, lead_v_lat)
+
+    ego_a_long = _clean_acceleration(
+        ego_a_long, acc_median_window, acc_smooth_window, acc_clip_min, acc_clip_max
+    )
+    ego_a_lat = _moving_average(_median_filter(ego_a_lat, acc_median_window), acc_smooth_window)
+    lead_a_long = _moving_average(_median_filter(lead_a_long, acc_median_window), acc_smooth_window)
+    lead_a_lat = _moving_average(_median_filter(lead_a_lat, acc_median_window), acc_smooth_window)
+    relative_v_long = [lead_v_long[i] - ego_v_long[i] for i in range(n)]
 
     # Path-derived kinematics are useful only when explicitly requested. Simulator positions
     # can have small dt / quantization artifacts, and high-order differencing amplifies them.
@@ -221,11 +315,11 @@ def calibrate_rows(
         else:
             yaws_deg.append(_unwrap_deg_deg(yaws_deg[i - 1], ang))
 
-    if kinematics_mode == "recompute":
-        acc, jerk = _speed_acc_jerk(ts, speeds, n)
-    else:
-        acc = [_parse_float(r.get("ego_acceleration"), 0.0) for r in rows_dicts]
-        jerk = [_parse_float(r.get("ego_jerk"), 0.0) for r in rows_dicts]
+    # Use decomposed longitudinal acceleration for modeling. The original
+    # ego_acceleration may be a scalar/magnitude depending on the logger, so we
+    # rewrite it to the cleaned x-direction acceleration for straight-road following.
+    acc = ego_a_long
+    jerk = _derivative(ts, acc)
 
     yaw_rad = [math.radians(y) for y in yaws_deg]
     yaw_rate = [0.0] * n
@@ -258,10 +352,22 @@ def calibrate_rows(
     for i, r in enumerate(rows_dicts):
         new_r = dict(r)
         new_r["ego_pos_y"] = "{:.6f}".format(ys[i])
+        new_r["ego_v_long"] = "{:.6f}".format(ego_v_long[i])
+        new_r["ego_v_lat"] = "{:.6f}".format(ego_v_lat[i])
+        new_r["ego_a_long"] = "{:.6f}".format(ego_a_long[i])
+        new_r["ego_a_lat"] = "{:.6f}".format(ego_a_lat[i])
+        new_r["lead_v_long"] = "{:.6f}".format(lead_v_long[i])
+        new_r["lead_v_lat"] = "{:.6f}".format(lead_v_lat[i])
+        new_r["lead_a_long"] = "{:.6f}".format(lead_a_long[i])
+        new_r["lead_a_lat"] = "{:.6f}".format(lead_a_lat[i])
+        new_r["relative_v_long"] = "{:.6f}".format(relative_v_long[i])
+        new_r["ego_acceleration"] = "{:.6f}".format(acc[i])
+        new_r["ego_jerk"] = "{:.6f}".format(jerk[i])
         if kinematics_mode == "recompute":
             new_r["ego_speed"] = "{:.6f}".format(speeds[i])
-            new_r["ego_acceleration"] = "{:.6f}".format(acc[i])
-            new_r["ego_jerk"] = "{:.6f}".format(jerk[i])
+
+        if "relative_speed" in new_r:
+            new_r["relative_speed"] = "{:.6f}".format(relative_v_long[i])
 
         if yaw_mode == "path":
             new_r["ego_yaw"] = "{:.6f}".format(_wrap_deg(yaws_deg[i]))
@@ -302,6 +408,30 @@ def main():
         type=int,
         default=9,
         help="Centered moving average window for calibrated ego_pos_y; 1 disables smoothing",
+    )
+    ap.add_argument(
+        "--acc_median_window",
+        type=int,
+        default=5,
+        help="Centered median filter window for ego_acceleration; 1 disables median filtering",
+    )
+    ap.add_argument(
+        "--acc_smooth_window",
+        type=int,
+        default=7,
+        help="Centered moving average window for ego_acceleration; 1 disables smoothing",
+    )
+    ap.add_argument(
+        "--acc_clip_min",
+        type=float,
+        default=-8.0,
+        help="Minimum ego_acceleration after cleaning (m/s^2)",
+    )
+    ap.add_argument(
+        "--acc_clip_max",
+        type=float,
+        default=6.0,
+        help="Maximum ego_acceleration after cleaning (m/s^2)",
     )
     ap.add_argument(
         "--kinematics_mode",
@@ -353,15 +483,33 @@ def main():
         rel = os.path.relpath(fp, args.data_dir).replace("\\", "/")
         with open(fp, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            fieldnames = reader.fieldnames
+            fieldnames = list(reader.fieldnames or [])
             rows = list(reader)
         if not fieldnames:
             continue
+        extra_fields = [
+            "ego_v_long",
+            "ego_v_lat",
+            "ego_a_long",
+            "ego_a_lat",
+            "lead_v_long",
+            "lead_v_lat",
+            "lead_a_long",
+            "lead_a_lat",
+            "relative_v_long",
+        ]
+        for name in extra_fields:
+            if name not in fieldnames:
+                fieldnames.append(name)
         calibrated = calibrate_rows(
             rows,
             y_center=args.y_center,
             lateral_scale=args.lateral_scale,
             y_smooth_window=args.y_smooth_window,
+            acc_median_window=args.acc_median_window,
+            acc_smooth_window=args.acc_smooth_window,
+            acc_clip_min=args.acc_clip_min,
+            acc_clip_max=args.acc_clip_max,
             kinematics_mode=args.kinematics_mode,
             yaw_mode=args.yaw_mode,
             wheelbase=args.wheelbase,

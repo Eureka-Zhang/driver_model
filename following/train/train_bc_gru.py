@@ -6,8 +6,25 @@ Input data layout:
   <data_dir>/T*/行车/<session>/segment_XXX.csv
 
 Default target:
-  predict longitudinal action/state at t:
-    [throttle, brake, ego_acceleration, ego_jerk]
+  predict longitudinal acceleration at t:
+    [ego_a_long]
+
+for i in $(seq 1 20); do
+  D="T${i}"
+  python /home/zwx/driver_model/train/train_bc_gru.py \
+    --data_dir /home/zwx/driver_model/outputs/following_il_clean_gap04 \
+    --out_dir /home/zwx/driver_model/outputs/il_bc_gru_per_driver/${D}_longitudinal_framewin \
+    --train_drivers ${D} \
+    --val_drivers ${D} \
+    --test_drivers ${D} \
+    --split_within_driver \
+    --train_ratio 0.7 \
+    --val_ratio 0.15 \
+    --test_ratio 0.15 \
+    --seq_len 20 \
+    --target_weights 1.0 \
+    --epochs 60
+done
 """
 from __future__ import print_function
 
@@ -27,19 +44,18 @@ from torch.utils.data import DataLoader, Dataset
 
 DEFAULT_FEATURES = [
     "dt_prev",
-    "ego_speed",
-    "ego_acceleration",
-    "ego_jerk",
+    "ego_v_long",
+    "ego_a_long",
     "distance_headway",
-    "relative_speed",
-    "lead_speed",
+    "relative_v_long",
+    "lead_v_long",
     "ttc",
     "ttc_valid",
     "time_headway",
     "time_headway_valid",
 ]
 
-DEFAULT_TARGETS = ["throttle", "brake", "ego_acceleration", "ego_jerk"]
+DEFAULT_TARGETS = ["ego_a_long"]
 
 
 def _parse_float(v):
@@ -316,7 +332,7 @@ def main():
     ap.add_argument(
         "--target_weights",
         type=str,
-        default="1.0,1.0,1.5,1.5",
+        default="1.0",
         help="Comma-separated weights aligned with targets",
     )
     ap.add_argument("--train_drivers", type=str, default="")

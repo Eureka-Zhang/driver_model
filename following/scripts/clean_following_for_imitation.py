@@ -30,6 +30,11 @@ Output layout (mirrors data/):
   <out_dir>/T*/行车/<session>/segment_001.csv, segment_002.csv, ...
   <out_dir>/cleaning_summary.csv          - one row per kept segment
   <out_dir>/cleaning_dropped.csv          - one row per dropped source file
+  
+  python3 /home/zwx/driver_model/scripts/clean_following_for_imitation.py \
+  --data_dir /home/zwx/driver_model/outputs/following_calibrated \
+  --out_dir /home/zwx/driver_model/outputs/following_il_clean_gap04
+  
 """
 from __future__ import print_function
 
