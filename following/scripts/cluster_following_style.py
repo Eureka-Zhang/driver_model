@@ -17,12 +17,26 @@ Row-level fields used (with fallbacks for older CSVs):
   lead_a_long      (else lead_acceleration)
   acc_diff := lead_long - ego_long   (summarized per driver)
 
+K-means uses **weighted** squared distance on z-scored features:
+  sum_j w_j (z_ij - c_kj)^2
+See ``--cluster_dim_weights`` (default aligns with ``CLUSTER_FEATURES``, including
+gap/time-gap/headway_mean/variance plus accel/decel magnitude medians/p75 — see script).
+Style naming (conservative / neutral / aggressive) still uses the separate heuristic
+in code, not these weights.
+
 Also writes following_style_prototypes.json: one prototype driver per style (closest to
-centroid in z-scored cluster feature space) for typical lateral residual replay.
+centroid in the same weighted metric) for typical lateral residual replay.
 
 Visualization (optional):
   python3 cluster_following_style.py --plot
   -> saves PCA 2D scatter to --out_dir/following_style_clusters_pca.png
+  
+  python3 following/scripts/cluster_following_style.py \
+    --data_dir following/outputs/following_il_clean_gap04 \
+    --out_dir following/outputs/following_style_clusters \
+    --plot \
+    --cluster_dim_weights 1,1,1,1,1,1,1 \
+    --plot_path following/outputs/following_style_clusters/my_pca2.png
 """
 from __future__ import print_function
 
@@ -85,6 +99,11 @@ def _std(values):
         return 0.0
     m = _mean(values)
     return (sum((x - m) ** 2 for x in values) / float(len(values))) ** 0.5
+
+
+def _var(values):
+    s = _std(values)
+    return s * s
 
 
 def _value(row, primary, fallback=None):
@@ -169,7 +188,9 @@ def _summarize_driver(paths):
         "n_rows": rows,
         "n_segments": len(paths),
         "ego_v_mean": _mean(ego_v),
+        "ego_v_var": _var(ego_v),
         "ego_v_p85": _percentile(ego_v, 85),
+        "headway_mean": _mean(headway),
         "headway_median": _percentile(headway, 50),
         "headway_p25": _percentile(headway, 25),
         "time_headway_median": _percentile(time_headway, 50),
@@ -183,7 +204,12 @@ def _summarize_driver(paths):
         "acc_diff_abs_p95": _percentile(acc_diff_abs, 95),
         "acc_mean": _mean(acc),
         "acc_std": _std(acc),
+        "acc_var": _var(acc),
         "abs_acc_p95": _percentile(acc_abs, 95),
+        "accel_abs_median": _percentile(positive_acc, 50),
+        "accel_abs_p75": _percentile(positive_acc, 75),
+        "decel_abs_median": _percentile(negative_acc_abs, 50),
+        "decel_abs_p75": _percentile(negative_acc_abs, 75),
         "positive_acc_mean": _mean(positive_acc),
         "decel_abs_mean": _mean(negative_acc_abs),
         "throttle_mean": _mean(throttle),
@@ -208,17 +234,29 @@ def _zscore_matrix(rows, feature_names):
     return mat
 
 
-def _kmeans(points, k, seed, max_iter=100):
+def _kmeans(points, k, seed, max_iter=100, dim_weights=None):
+    """Lloyd on weighted SSE: sum_j w_j (p_j - c_j)^2. Centroids remain coordinate-wise means."""
     rng = random.Random(seed)
     if len(points) < k:
         raise RuntimeError("Need at least {} drivers for clustering.".format(k))
+    d = len(points[0])
+    if dim_weights is None:
+        w = [1.0] * d
+    else:
+        w = list(dim_weights)
+        if len(w) != d:
+            raise RuntimeError(
+                "dim_weights length {} != feature dim {}".format(len(w), d)
+            )
+        if any(x <= 0.0 for x in w):
+            raise RuntimeError("dim_weights must be positive")
     centers = [list(p) for p in rng.sample(points, k)]
     labels = [0] * len(points)
     for _ in range(max_iter):
         changed = False
         for i, p in enumerate(points):
             dists = [
-                sum((p[j] - c[j]) ** 2 for j in range(len(p)))
+                sum(w[j] * (p[j] - c[j]) ** 2 for j in range(d))
                 for c in centers
             ]
             lab = min(range(k), key=lambda x: dists[x])
@@ -233,7 +271,7 @@ def _kmeans(points, k, seed, max_iter=100):
             else:
                 new_centers.append([
                     sum(p[j] for p in members) / float(len(members))
-                    for j in range(len(points[0]))
+                    for j in range(d)
                 ])
         centers = new_centers
         if not changed:
@@ -255,8 +293,110 @@ def _pca2(zpoints):
     return proj, var_frac
 
 
-def _style_prototype_summary(rows, points, cluster_features):
-    """One prototype driver per style = closest to cluster centroid in z-scored feature space."""
+CLUSTER_FEATURES = [
+    "headway_median",
+    "headway_p25",
+    "time_headway_median",
+    "time_headway_p25",
+    "headway_mean",
+    "ego_v_var",
+    "acc_var",
+    # Ego longitudinal: meaningful accel (m/s^2, a>0.2) and decel (|a| for a<-0.2)
+    "accel_abs_median",
+    "accel_abs_p75",
+    "decel_abs_median",
+    "decel_abs_p75",
+]
+
+
+def parse_cluster_dim_weights(s):
+    """Parse comma-separated positive weights; length must match CLUSTER_FEATURES."""
+    dim_weights = [float(x.strip()) for x in s.split(",") if str(x).strip()]
+    if len(dim_weights) != len(CLUSTER_FEATURES):
+        raise RuntimeError(
+            "cluster_dim_weights: expected {} values ({}), got {}".format(
+                len(CLUSTER_FEATURES),
+                ",".join(CLUSTER_FEATURES),
+                len(dim_weights),
+            )
+        )
+    if any(w <= 0.0 for w in dim_weights):
+        raise RuntimeError("cluster_dim_weights must all be positive")
+    return dim_weights
+
+
+def assign_kmeans_styles(rows, dim_weights, seed):
+    """
+    Run z-score + weighted k-means (k=3) and assign conservative/neutral/aggressive.
+
+    Mutates each row in ``rows`` with keys cluster_id, style_label.
+    Each row must include driver_id and all CLUSTER_FEATURES fields (raw metrics, not z).
+
+    Returns:
+        dict with keys: points (z-scored rows), cluster_features, numeric_cluster_to_style
+    """
+    cluster_features = list(CLUSTER_FEATURES)
+    if len(dim_weights) != len(cluster_features):
+        raise RuntimeError(
+            "dim_weights length {} != {}".format(len(dim_weights), len(cluster_features))
+        )
+    if any(w <= 0.0 for w in dim_weights):
+        raise RuntimeError("dim_weights must be positive")
+    if len(rows) < 3:
+        raise RuntimeError("Need at least 3 drivers for k=3 clustering.")
+
+    points = _zscore_matrix(rows, cluster_features)
+    labels, _ = _kmeans(points, 3, seed, dim_weights=dim_weights)
+
+    cluster_scores = {}
+    for lab in range(3):
+        idxs = [i for i, x in enumerate(labels) if x == lab]
+        if not idxs:
+            cluster_scores[lab] = 0.0
+            continue
+        score = 0.0
+        for i in idxs:
+            p = points[i]
+            f = dict(zip(cluster_features, p))
+            score += (
+                -1.0 * f["time_headway_median"]
+                -1.0 * f["time_headway_p25"]
+                -1.0 * f["headway_median"]
+                -0.9 * f["headway_p25"]
+                -0.8 * f["headway_mean"]
+                +1.0 * f["ego_v_var"]
+                +1.0 * f["acc_var"]
+                +0.5 * f["accel_abs_median"]
+                +0.5 * f["accel_abs_p75"]
+                +0.5 * f["decel_abs_median"]
+                +0.5 * f["decel_abs_p75"]
+            )
+        cluster_scores[lab] = score / float(len(idxs))
+    ordered = sorted(cluster_scores.keys(), key=lambda x: cluster_scores[x])
+    label_name = {
+        ordered[0]: "conservative",
+        ordered[1]: "neutral",
+        ordered[2]: "aggressive",
+    }
+
+    for i, r in enumerate(rows):
+        r["cluster_id"] = labels[i]
+        r["style_label"] = label_name[labels[i]]
+
+    return {
+        "points": points,
+        "cluster_features": cluster_features,
+        "numeric_cluster_to_style": label_name,
+    }
+
+
+def _style_prototype_summary(rows, points, cluster_features, dim_weights=None):
+    """One prototype driver per style = closest to cluster centroid (same metric as k-means)."""
+    w = np.ones(len(cluster_features), dtype=np.float64)
+    if dim_weights is not None:
+        w = np.asarray(dim_weights, dtype=np.float64)
+        if w.shape[0] != len(cluster_features):
+            raise RuntimeError("dim_weights length mismatch in prototype summary")
     by_style = {}
     for i, r in enumerate(rows):
         sty = r["style_label"]
@@ -266,7 +406,7 @@ def _style_prototype_summary(rows, points, cluster_features):
         idxs = by_style[sty]
         pts = np.asarray([points[i] for i in idxs], dtype=np.float64)
         c = pts.mean(axis=0)
-        d2 = np.sum((pts - c) ** 2, axis=1)
+        d2 = np.sum(w * (pts - c) ** 2, axis=1)
         j = int(np.argmin(d2))
         proto_i = idxs[j]
         summary[sty] = {
@@ -327,7 +467,7 @@ def _save_cluster_plot(rows, zpoints, out_path):
     pct1 = 100.0 * var_frac[1] if len(var_frac) > 1 else 0.0
     ax.set_xlabel("PC1 ({:.0f}% variance)".format(pct0))
     ax.set_ylabel("PC2 ({:.0f}% variance)".format(pct1))
-    ax.set_title("Car-following style clusters (PCA on z-scored gap / Δv / Δa features)")
+    ax.set_title("Car-following style clusters (PCA on z-scored gap + variance features)")
     ax.grid(True, linestyle="--", alpha=0.35)
     ax.legend(loc="best", framealpha=0.9)
     fig.tight_layout()
@@ -360,6 +500,18 @@ def main():
         default="",
         help="PNG path (default: <out_dir>/following_style_clusters_pca.png)",
     )
+    ap.add_argument(
+        "--cluster_dim_weights",
+        type=str,
+        default="2,1,1,1,1,1,1,1,1,1,1",
+        help=(
+            "Comma-separated positive weights for k-means / prototype distance on z-scored "
+            "features, order: headway_median, headway_p25, time_headway_median, "
+            "time_headway_p25, headway_mean, ego_v_var, acc_var, "
+            "accel_abs_median, accel_abs_p75, decel_abs_median, decel_abs_p75 "
+            "(accel/decel use samples with a>0.2 / a<-0.2 on ego longitudinal a)."
+        ),
+    )
     args = ap.parse_args()
 
     paths = _discover_segments(args.data_dir)
@@ -373,52 +525,15 @@ def main():
         metrics["driver_id"] = driver
         rows.append(metrics)
 
-    # k-means on **interaction / difference** summaries only (not absolute ego speed or pedals).
-    cluster_features = [
-        "headway_median",
-        "headway_p25",
-        "time_headway_median",
-        "time_headway_p25",
-        "relative_v_abs_mean",
-        "relative_v_std",
-        "acc_diff_abs_mean",
-        "acc_diff_abs_p95",
-    ]
-    points = _zscore_matrix(rows, cluster_features)
-    labels, _ = _kmeans(points, 3, args.seed)
+    cluster_features = list(CLUSTER_FEATURES)
+    dim_weights = parse_cluster_dim_weights(args.cluster_dim_weights)
+    print(
+        "[INFO] k-means dim weights:",
+        ", ".join("{}={}".format(n, w) for n, w in zip(cluster_features, dim_weights)),
+    )
 
-    # Rank clusters: conservative = larger gaps/time gaps, smaller |Δv| and |Δa| activity.
-    cluster_scores = {}
-    for lab in range(3):
-        idxs = [i for i, x in enumerate(labels) if x == lab]
-        if not idxs:
-            cluster_scores[lab] = 0.0
-            continue
-        score = 0.0
-        for i in idxs:
-            p = points[i]
-            f = dict(zip(cluster_features, p))
-            score += (
-                -1.0 * f["time_headway_median"]
-                -1.0 * f["time_headway_p25"]
-                -1.0 * f["headway_median"]
-                -0.9 * f["headway_p25"]
-                +1.0 * f["relative_v_abs_mean"]
-                +0.8 * f["relative_v_std"]
-                +1.0 * f["acc_diff_abs_mean"]
-                +1.0 * f["acc_diff_abs_p95"]
-            )
-        cluster_scores[lab] = score / float(len(idxs))
-    ordered = sorted(cluster_scores.keys(), key=lambda x: cluster_scores[x])
-    label_name = {
-        ordered[0]: "conservative",
-        ordered[1]: "neutral",
-        ordered[2]: "aggressive",
-    }
-
-    for i, r in enumerate(rows):
-        r["cluster_id"] = labels[i]
-        r["style_label"] = label_name[labels[i]]
+    result = assign_kmeans_styles(rows, dim_weights, args.seed)
+    points = result["points"]
 
     os.makedirs(args.out_dir, exist_ok=True)
     out_fp = os.path.join(args.out_dir, "driver_following_style_clusters.csv")
@@ -426,6 +541,8 @@ def main():
         "n_segments",
         "n_rows",
     ] + cluster_features + [
+        "positive_acc_mean",
+        "decel_abs_mean",
         "relative_v_mean",
         "relative_v_abs_p95",
         "acc_diff_mean",
@@ -443,11 +560,14 @@ def main():
             w.writerow({k: r.get(k, "") for k in fieldnames})
 
     proto_path = os.path.join(args.out_dir, "following_style_prototypes.json")
-    proto_summary = _style_prototype_summary(rows, points, cluster_features)
+    proto_summary = _style_prototype_summary(
+        rows, points, cluster_features, dim_weights=dim_weights
+    )
     with open(proto_path, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "cluster_features_zscored_pca_order": cluster_features,
+                "cluster_dim_weights": dict(zip(cluster_features, dim_weights)),
                 "styles": proto_summary,
             },
             f,

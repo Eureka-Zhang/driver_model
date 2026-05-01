@@ -35,6 +35,17 @@ python3 /home/zwx/driver_model/scripts/calibrate_following_data.py \
   --acc_smooth_window 7 \
   --acc_clip_min -8 \
   --acc_clip_max 6
+  
+  
+  cd /home/zwx/driver_model
+python3 following/scripts/calibrate_following_data.py \
+  --data_dir data/T9 \
+  --out_dir following/outputs/following_calibrated/T9 \
+  --kinematics_mode preserve \
+  --acc_median_window 5 \
+  --acc_smooth_window 7 \
+  --acc_clip_min -8 \
+  --acc_clip_max 6
 """
 from __future__ import print_function
 

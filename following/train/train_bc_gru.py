@@ -11,9 +11,9 @@ Default target:
 
 for i in $(seq 1 20); do
   D="T${i}"
-  python /home/zwx/driver_model/train/train_bc_gru.py \
-    --data_dir /home/zwx/driver_model/outputs/following_il_clean_gap04 \
-    --out_dir /home/zwx/driver_model/outputs/il_bc_gru_per_driver/${D}_longitudinal_framewin \
+  python /home/zwx/driver_model/following/train/train_bc_gru.py \
+    --data_dir /home/zwx/driver_model/following/outputs/following_il_clean_gap04 \
+    --out_dir /home/zwx/driver_model/following/outputs/il_bc_gru_per_driver/${D}_longitudinal_framewin \
     --train_drivers ${D} \
     --val_drivers ${D} \
     --test_drivers ${D} \
@@ -25,6 +25,20 @@ for i in $(seq 1 20); do
     --target_weights 1.0 \
     --epochs 60
 done
+
+  python /home/zwx/driver_model/following/train/train_bc_gru.py \
+    --data_dir /home/zwx/driver_model/following/outputs/following_il_clean_gap04/T9 \
+    --out_dir /home/zwx/driver_model/following/outputs/il_bc_gru_per_driver/T9_longitudinal_framewin \
+    --train_drivers T9 \
+    --val_drivers T9 \
+    --test_drivers T9 \
+    --split_within_driver \
+    --train_ratio 0.7 \
+    --val_ratio 0.15 \
+    --test_ratio 0.15 \
+    --seq_len 20 \
+    --target_weights 1.0 \
+    --epochs 60
 """
 from __future__ import print_function
 
