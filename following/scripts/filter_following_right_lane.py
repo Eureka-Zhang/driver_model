@@ -5,9 +5,22 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-'''
+"""
+Filter following trajectories by right-lane occupancy.
 
-'''
+``ego_pos_y`` is the vehicle lateral **center**. By default ``--ego_half_width_m 0.9`` treats
+violation as **wheel** envelope: center must stay in
+[right_y_min + hw, right_y_max - hw] so edges do not cross lane lines (straight road).
+Use ``--ego_half_width_m 0`` for center-only (legacy).
+
+With ``--save_figures`` (default on), writes Matplotlib PNGs under ``out_dir/figures/`` in the
+same style as ``overtaking/scripts/segment_overtaking_phases`` (``ego_pos_y`` + ``steer`` vs
+``time - t0``, right-lane band, optional center-corridor lines, violation highlights). No HTML.
+
+python3 following/scripts/filter_following_right_lane.py \
+  --data_dir /home/zwx/driver_model/following/outputs/following_calibrated \
+  --out_dir /home/zwx/driver_model/following/outputs/following_right_lane_filter2
+"""
 
 @dataclass
 class Segment:
@@ -91,23 +104,32 @@ def detect_violation_segments(
     right_y_max: float,
     gap_threshold_sec: float,
     min_segment_duration_sec: float,
-) -> Tuple[List[Segment], List[Tuple[float, float, bool]]]:
+    ego_half_width_m: float = 0.0,
+) -> Tuple[List[Segment], List[Tuple[float, float, bool, float]]]:
     """
     Returns:
       - violation segments (continuous outside-range intervals)
-      - point series for visualization: (timestamp, ego_pos_y, is_outside)
+      - point series for visualization: (timestamp, ego_pos_y, is_outside, steer)
+
+    ``ego_pos_y`` is treated as the vehicle lateral reference **center** (simulator body center).
+    If ``ego_half_width_m`` > 0, violation uses wheel/track envelope: outer edge ``y - hw`` must
+    stay >= ``right_y_min``, inner edge ``y + hw`` must stay <= ``right_y_max`` (straight-road
+    approximation; ignores yaw widening). If ``ego_half_width_m`` <= 0, falls back to center-only.
     """
-    ts_y_outside: List[Tuple[float, float, bool]] = []
+    ts_y_outside: List[Tuple[float, float, bool, float]] = []
     segs: List[Segment] = []
 
     # Build time series (skip rows with missing fields)
-    series: List[Tuple[float, float, int]] = []
+    series: List[Tuple[float, float, int, float]] = []
     for r in rows:
         ts = parse_float(r, "timestamp")
         y = parse_float(r, "ego_pos_y")
         if ts is None or y is None:
             continue
-        series.append((ts, y, parse_int(r, "frame", default=0)))
+        sv = parse_float(r, "steer")
+        series.append(
+            (ts, y, parse_int(r, "frame", default=0), 0.0 if sv is None else float(sv))
+        )
 
     if not series:
         return [], []
@@ -120,13 +142,35 @@ def detect_violation_segments(
     cur_start_frame = 0
     cur_violation_count = 0
     cur_total_count = 0
+    cur_has_outer = False  # outer wheel / shoulder side (y too negative)
+    cur_has_inner = False  # inner wheel / toward adjacent lane (y too positive)
 
-    def outside_flag(y: float) -> bool:
-        return (y < right_y_min) or (y > right_y_max)
+    hw = float(ego_half_width_m)
 
-    for i, (ts, y, frame) in enumerate(series):
-        out = outside_flag(y)
-        ts_y_outside.append((ts, y, out))
+    def lateral_outside(y: float) -> bool:
+        if hw <= 0.0:
+            return (y < right_y_min) or (y > right_y_max)
+        return (y - hw < right_y_min) or (y + hw > right_y_max)
+
+    def accumulate_edge_flags(y: float) -> None:
+        nonlocal cur_has_outer, cur_has_inner
+        if hw <= 0.0:
+            cur_has_outer = cur_has_outer or (y < right_y_min)
+            cur_has_inner = cur_has_inner or (y > right_y_max)
+        else:
+            cur_has_outer = cur_has_outer or ((y - hw) < right_y_min)
+            cur_has_inner = cur_has_inner or ((y + hw) > right_y_max)
+
+    def violation_type_from_flags() -> str:
+        if cur_has_inner and cur_has_outer:
+            return "out_of_bounds"
+        if cur_has_inner:
+            return "too_right"
+        return "too_left"
+
+    for i, (ts, y, frame, steer) in enumerate(series):
+        out = lateral_outside(y)
+        ts_y_outside.append((ts, y, out, steer))
 
         if out:
             if cur_start_idx is None:
@@ -138,6 +182,9 @@ def detect_violation_segments(
                 cur_max_y = y
                 cur_violation_count = 1
                 cur_total_count = 1
+                cur_has_outer = False
+                cur_has_inner = False
+                accumulate_edge_flags(y)
             else:
                 # split if there's a time gap (prevents merging across reboots / stalls)
                 prev_ts = series[i - 1][0]
@@ -151,11 +198,15 @@ def detect_violation_segments(
                     cur_start_ts = ts
                     cur_start_frame = frame
                     cur_start_idx = i
+                    cur_has_outer = False
+                    cur_has_inner = False
+                    accumulate_edge_flags(y)
                 else:
                     cur_violation_count += 1
                     cur_total_count += 1
                     cur_min_y = min(cur_min_y, y)
                     cur_max_y = max(cur_max_y, y)
+                    accumulate_edge_flags(y)
         else:
             # if we were in a segment, close it
             if cur_start_idx is not None:
@@ -164,13 +215,7 @@ def detect_violation_segments(
                 end_frame = series[i - 1][2]
                 duration = end_ts - cur_start_ts
                 if duration >= min_segment_duration_sec:
-                    # Determine violation type by min/max relative to bounds
-                    if cur_max_y > right_y_max and cur_min_y < right_y_min:
-                        vtype = "out_of_bounds"
-                    elif cur_max_y > right_y_max:
-                        vtype = "too_right"
-                    else:
-                        vtype = "too_left"
+                    vtype = violation_type_from_flags()
                     segs.append(
                         Segment(
                             start_ts=cur_start_ts,
@@ -198,12 +243,7 @@ def detect_violation_segments(
         end_frame = series[-1][2]
         duration = end_ts - cur_start_ts
         if duration >= min_segment_duration_sec:
-            if cur_max_y > right_y_max and cur_min_y < right_y_min:
-                vtype = "out_of_bounds"
-            elif cur_max_y > right_y_max:
-                vtype = "too_right"
-            else:
-                vtype = "too_left"
+            vtype = violation_type_from_flags()
             segs.append(
                 Segment(
                     start_ts=cur_start_ts,
@@ -242,102 +282,107 @@ def export_segment_csv(
                 w.writerow(r)
 
 
-def make_svg_html(
-    html_path: str,
+def _figure_title_ascii(s: str) -> str:
+    """ASCII-safe title for matplotlib (optional folder names in rel path)."""
+    if not s:
+        return "session"
+    out = "".join(c if 32 <= ord(c) < 127 else "_" for c in s)
+    out = "_".join(x for x in out.split("_") if x)
+    return out.strip("_") or "session"
+
+
+def save_following_lane_figure(
+    out_png_path: str,
     title: str,
-    series: List[Tuple[float, float, bool]],
+    series: List[Tuple[float, float, bool, float]],
+    segs: List[Segment],
     right_y_min: float,
     right_y_max: float,
-):
+    ego_half_width_m: float,
+) -> bool:
+    """
+    Matplotlib style aligned with overtaking segment_overtaking_phases.save_phase_figure:
+    top: ego_pos_y vs time with right-lane band; bottom: steer vs time.
+    """
     if not series:
-        return
+        return False
+    try:
+        import matplotlib
 
-    ts_vals = [p[0] for p in series]
-    y_vals = [p[1] for p in series]
-    t_min, t_max = min(ts_vals), max(ts_vals)
-    y_min, y_max = min(y_vals), max(y_vals)
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(f"[WARN] matplotlib not installed; skip figure: {out_png_path}")
+        return False
 
-    # Add margin for better view
-    pad_t = max(1e-6, 0.02 * (t_max - t_min) if t_max > t_min else 1.0)
-    pad_y = max(1e-6, 0.05 * (y_max - y_min) if y_max > y_min else 1.0)
-    t_min -= pad_t
-    t_max += pad_t
-    y_min -= pad_y
-    y_max += pad_y
+    times = [p[0] for p in series]
+    ys = [p[1] for p in series]
+    outside = [p[2] for p in series]
+    steers = [p[3] for p in series]
+    n = len(times)
+    t0 = times[0]
+    t_rel = [t - t0 for t in times]
+    hw = float(ego_half_width_m)
 
-    def x_of(t: float, w: int) -> float:
-        if t_max == t_min:
-            return w / 2.0
-        return (t - t_min) / (t_max - t_min) * w
+    fig, (ax_y, ax_st) = plt.subplots(
+        2,
+        1,
+        figsize=(14, 9),
+        sharex=True,
+        gridspec_kw={"height_ratios": [2.2, 1]},
+    )
 
-    def y_of(y: float, h: int) -> float:
-        if y_max == y_min:
-            return h / 2.0
-        # SVG y grows downward
-        return (1.0 - (y - y_min) / (y_max - y_min)) * h
+    ax_y.axhspan(right_y_min, right_y_max, color="#c8e6c9", alpha=0.35, label="Right lane band")
+    ax_y.axhline(right_y_min, color="#2e7d32", linewidth=0.8, linestyle="--")
+    ax_y.axhline(right_y_max, color="#2e7d32", linewidth=0.8, linestyle="--")
+    if hw > 0.0:
+        y_lo = right_y_min + hw
+        y_hi = right_y_max - hw
+        ax_y.axhline(y_lo, color="#9467bd", linewidth=1.0, linestyle="--", alpha=0.95, label="Center corridor (wheels inside)")
+        ax_y.axhline(y_hi, color="#9467bd", linewidth=1.0, linestyle="--", alpha=0.95, label="_nolegend_")
 
-    W, H = 1000, 420
-    left_margin = 70
-    top_margin = 30
-    plot_w = W - left_margin - 20
-    plot_h = H - top_margin - 20
+    for seg in segs:
+        a = seg.start_ts - t0
+        b = seg.end_ts - t0
+        if b >= a:
+            ax_y.axvspan(a, b, alpha=0.10, color="#f44336")
+            ax_st.axvspan(a, b, alpha=0.10, color="#f44336")
 
-    def x_plot(t: float) -> float:
-        return left_margin + x_of(t, plot_w)
+    ax_y.plot(t_rel, ys, color="0.2", linewidth=1.2, label="ego_pos_y (center)")
+    viol_idx = [i for i in range(n) if outside[i]]
+    if viol_idx:
+        ax_y.scatter(
+            [t_rel[i] for i in viol_idx],
+            [ys[i] for i in viol_idx],
+            s=44,
+            c="crimson",
+            marker="x",
+            linewidths=1.5,
+            zorder=5,
+            label="Line cross (right lane envelope)",
+        )
 
-    def y_plot(y: float) -> float:
-        return top_margin + y_of(y, plot_h)
+    ax_y.set_ylabel("ego_pos_y (m)")
+    n_v = sum(1 for o in outside if o)
+    ax_y.set_title(
+        _figure_title_ascii(title)
+        + f"   n_out={n_v}/{n}   hw={hw:.2f}m   lane=[{right_y_min:.2f},{right_y_max:.2f}]"
+    )
+    ax_y.grid(True, alpha=0.3)
+    ax_y.legend(loc="upper right", fontsize=8, ncol=2)
 
-    # Build polylines
-    grey_pts = []
-    red_pts = []
-    for ts, y, outside in series:
-        pt = (x_plot(ts), y_plot(y))
-        if outside:
-            red_pts.append(pt)
-        else:
-            grey_pts.append(pt)
+    ax_st.plot(t_rel, steers, color="purple", linewidth=0.9, alpha=0.85, label="steer")
+    ax_st.axhline(0.0, color="0.5", linewidth=0.6)
+    ax_st.set_xlabel("time - t0 (s)")
+    ax_st.set_ylabel("steer")
+    ax_st.legend(loc="upper right", fontsize=8)
+    ax_st.grid(True, alpha=0.3)
 
-    # Convert points to "x,y x,y ..."
-    def pts_to_str(pts: List[Tuple[float, float]]) -> str:
-        return " ".join([f"{p[0]:.2f},{p[1]:.2f}" for p in pts])
-
-    y_min_line = y_plot(right_y_min)
-    y_max_line = y_plot(right_y_max)
-
-    html = f"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>{title}</title>
-</head>
-<body style="font-family: sans-serif;">
-<h3>{title}</h3>
-<div style="color:#444;margin-bottom:8px;">
-  右车道范围(ego_pos_y): [{right_y_min:.2f}, {right_y_max:.2f}]
-</div>
-<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" style="border:1px solid #ddd;background:#fff;">
-  <!-- boundaries -->
-  <line x1="{left_margin}" y1="{y_min_line:.2f}" x2="{left_margin+plot_w:.2f}" y2="{y_min_line:.2f}" stroke="#1f77b4" stroke-width="2" opacity="0.9"/>
-  <line x1="{left_margin}" y1="{y_max_line:.2f}" x2="{left_margin+plot_w:.2f}" y2="{y_max_line:.2f}" stroke="#1f77b4" stroke-width="2" opacity="0.9"/>
-  <text x="{left_margin+5}" y="{y_min_line-6:.2f}" fill="#1f77b4" font-size="12">y_min</text>
-  <text x="{left_margin+5}" y="{y_max_line-6:.2f}" fill="#1f77b4" font-size="12">y_max</text>
-
-  <!-- inside points -->
-  <polyline fill="none" stroke="#999" stroke-width="1.5" points="{pts_to_str(grey_pts)}" opacity="0.85"/>
-  <!-- outside points -->
-  <polyline fill="none" stroke="#d62728" stroke-width="2.0" points="{pts_to_str(red_pts)}" opacity="0.95"/>
-
-  <!-- axes labels (minimal) -->
-  <text x="{left_margin+5}" y="{top_margin+plot_h+18}" fill="#333" font-size="12">timestamp</text>
-  <text x="10" y="{top_margin+15}" fill="#333" font-size="12">ego_pos_y</text>
-</svg>
-</body>
-</html>
-"""
-    os.makedirs(os.path.dirname(html_path), exist_ok=True)
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_png_path), exist_ok=True)
+    fig.savefig(out_png_path, dpi=140)
+    plt.close(fig)
+    return True
 
 
 def main():
@@ -347,18 +392,29 @@ def main():
 
     ap.add_argument("--right_y_min", type=float, default=-9.50)
     ap.add_argument("--right_y_max", type=float, default=-5.75)
+    ap.add_argument(
+        "--ego_half_width_m",
+        type=float,
+        default=0.9,
+        help="Lateral half-width of vehicle (m): outer edge y-hw, inner y+hw vs lane edges. "
+        "Trajectory ego_pos_y is body center. Set 0 to use center-only (legacy).",
+    )
     ap.add_argument("--gap_threshold_sec", type=float, default=0.20)
     ap.add_argument("--min_segment_duration_sec", type=float, default=0.50)
 
     ap.add_argument("--save_segment_csv", action="store_true", default=False)
-    ap.add_argument("--save_html", action="store_true", default=True)
+    ap.add_argument(
+        "--no_save_figures",
+        action="store_false",
+        dest="save_figures",
+        help="Disable PNG figures under out_dir/figures (matplotlib).",
+    )
+    ap.set_defaults(save_figures=True)
     ap.add_argument("--max_files", type=int, default=0, help="0 means all candidates")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    html_dir = os.path.join(args.out_dir, "html")
     seg_dir = os.path.join(args.out_dir, "extracted_segments")
-    os.makedirs(html_dir, exist_ok=True)
     os.makedirs(seg_dir, exist_ok=True)
 
     csv_paths = discover_following_csvs(args.data_dir)
@@ -369,6 +425,7 @@ def main():
     compliant_rows: List[Dict[str, str]] = []
     total_files = 0
     files_with_violations = 0
+    n_figures_written = 0
 
     for fp in csv_paths:
         total_files += 1
@@ -387,6 +444,7 @@ def main():
             right_y_max=args.right_y_max,
             gap_threshold_sec=args.gap_threshold_sec,
             min_segment_duration_sec=args.min_segment_duration_sec,
+            ego_half_width_m=args.ego_half_width_m,
         )
 
         if segs:
@@ -416,16 +474,23 @@ def main():
                 out_path = os.path.join(seg_dir, out_name)
                 export_segment_csv(rows, out_path, seg.start_ts, seg.end_ts)
 
-        if args.save_html:
-            html_name = f"{_sanitize_filename(rel)}.html"
-            html_path = os.path.join(html_dir, html_name)
-            make_svg_html(
-                html_path=html_path,
-                title=f"{rel}",
+        if args.save_figures:
+            rel_slash = rel.replace("\\", "/")
+            sess = os.path.basename(os.path.dirname(fp))
+            stem = _sanitize_filename(sess or "session")
+            fig_dir = os.path.join(args.out_dir, "figures", os.path.dirname(rel_slash))
+            out_png = os.path.join(fig_dir, f"{stem}_following_lane.png")
+            ok = save_following_lane_figure(
+                out_png_path=out_png,
+                title=rel_slash,
                 series=series,
+                segs=segs,
                 right_y_min=args.right_y_min,
                 right_y_max=args.right_y_max,
+                ego_half_width_m=args.ego_half_width_m,
             )
+            if ok:
+                n_figures_written += 1
 
     # Export summary CSV
     out_csv = os.path.join(args.out_dir, "segments_summary.csv")
@@ -455,94 +520,11 @@ def main():
         for row in sorted(compliant_rows, key=lambda x: x["file"]):
             w.writerow(row)
 
-    # Build index.html
-    index_path = os.path.join(args.out_dir, "index.html")
-    # simple index table
-    sorted_rows = sorted(seg_summary_rows, key=lambda x: (x["file"], x["segment_id"]))
-    # To avoid huge html, only show top N links
-    N = 500
-    shown = sorted_rows[:N]
-
-    # Build links
-    link_lines = []
-    for r in shown:
-        rel_file = r["file"]
-        html_file = f"{_sanitize_filename(rel_file)}.html"
-        link_lines.append(
-            f'<tr><td style="padding:6px 8px; border:1px solid #eee; white-space:nowrap;">{r["file"]}</td>'
-            f'<td style="padding:6px 8px; border:1px solid #eee;">{r["segment_id"]}</td>'
-            f'<td style="padding:6px 8px; border:1px solid #eee;">{r["violation_type"]}</td>'
-            f'<td style="padding:6px 8px; border:1px solid #eee;">{float(r["duration_sec"]):.3f}s</td>'
-            f'<td style="padding:6px 8px; border:1px solid #eee;"><a href="html/{html_file}" target="_blank">view</a></td></tr>'
-        )
-    compliant_sorted = sorted(compliant_rows, key=lambda x: x["file"])
-    compliant_shown = compliant_sorted[:N]
-
-    html_index = f"""<!doctype html>
-<html>
-<head><meta charset="utf-8"/><title>Right-lane violations index</title></head>
-<body style="font-family:sans-serif;">
-<h2>Following trajectories right-lane check (ego_pos_y)</h2>
-<div style="color:#444;margin-bottom:8px;">
-  Candidate files: {total_files}<br/>
-  Files with violations: {files_with_violations}<br/>
-  Compliant files: {total_files - files_with_violations}<br/>
-  Right lane y-range: [{args.right_y_min:.2f}, {args.right_y_max:.2f}]<br/>
-  Min segment duration: {args.min_segment_duration_sec:.2f}s<br/>
-  Gap threshold: {args.gap_threshold_sec:.2f}s
-</div>
-
-<div style="margin:12px 0;">
-  <a href="segments_summary.csv">Download segments_summary.csv</a><br/>
-  <a href="compliant_files.csv">Download compliant_files.csv</a>
-</div>
-
-<h3>Compliant trajectories (all)</h3>
-<table style="border-collapse:collapse; font-size:13px; margin-bottom:16px;">
-  <thead>
-    <tr>
-      <th style="padding:6px 8px; border:1px solid #eee; background:#fafafa;">file</th>
-      <th style="padding:6px 8px; border:1px solid #eee; background:#fafafa;">html</th>
-    </tr>
-  </thead>
-  <tbody>
-    {''.join(
-        f'<tr><td style="padding:6px 8px; border:1px solid #eee; white-space:nowrap;">{r["file"]}</td>'
-        f'<td style="padding:6px 8px; border:1px solid #eee;"><a href="html/{_sanitize_filename(r["file"])}.html" target="_blank">view</a></td></tr>'
-        for r in compliant_shown
-    )}
-  </tbody>
-</table>
-
-<h3>Violation segments</h3>
-<table style="border-collapse:collapse; font-size:13px;">
-  <thead>
-    <tr>
-      <th style="padding:6px 8px; border:1px solid #eee; background:#fafafa;">file</th>
-      <th style="padding:6px 8px; border:1px solid #eee; background:#fafafa;">segment</th>
-      <th style="padding:6px 8px; border:1px solid #eee; background:#fafafa;">type</th>
-      <th style="padding:6px 8px; border:1px solid #eee; background:#fafafa;">duration</th>
-      <th style="padding:6px 8px; border:1px solid #eee; background:#fafafa;">html</th>
-    </tr>
-  </thead>
-  <tbody>
-    {''.join(link_lines)}
-  </tbody>
-</table>
-<div style="margin-top:10px;color:#666;">
-  Showing first {len(compliant_shown)} compliant files and first {min(len(sorted_rows), N)} violation segments.
-  Open compliant_files.csv / segments_summary.csv for full list.
-</div>
-</body></html>
-"""
-    with open(index_path, "w", encoding="utf-8") as f:
-        f.write(html_index)
-
     print(f"[OK] candidates: {total_files}, files_with_violations: {files_with_violations}")
     print(f"[OK] segments_summary.csv: {out_csv}")
     print(f"[OK] compliant_files.csv: {compliant_csv}")
-    if args.save_html:
-        print(f"[OK] html index: {index_path}")
+    if args.save_figures:
+        print(f"[OK] figures written: {n_figures_written} under {os.path.join(args.out_dir, 'figures')}")
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@
 可选扩展：
 
 - **跟驰风格聚类**：`scripts/cluster_following_style.py`
-- **按风格池化多人数据训练**：`scripts/train_bc_following_by_style.py`（内部调用 `train_bc_gru.py`）
+- **按风格池化多人数据训练**：`train/train_bc_following_by_style.py`（命令行指定各风格司机，`train_bc_gru.py`）
 
 ---
 
@@ -222,7 +222,7 @@ python3 following/train/train_bc_gru.py \
 
 ### 5.1 目的
 
-在**不改变前车轨迹、车间距、时间轴等记录**的前提下，用训练好的 BC-GRU **替换自车纵向加速度**，再**数值积分**更新 `ego_pos_x` 与纵向速度相关列；横向通过 **`original_jitter` 模式**从某司机的横向残差池中抽样，叠加在 `lane_center_y` 上，得到个性化“车道内抖动”。
+在**不改变前车轨迹、车间距、时间轴等记录**的前提下，用训练好的 BC-GRU **替换自车纵向加速度**，再**数值积分**更新 `ego_pos_x` 与纵向速度相关列；横向可选用 **`original_jitter`**（从单司机池中随机环形抽样）或 **`pooled_mean_smooth`**（多名司机残差按 T* 顺序拼接后滑动平均，再按行号确定性循环铺满轨迹），叠加在 `lane_center_y` 上。
 
 ### 5.2 输入数据发现
 
@@ -245,18 +245,21 @@ python3 following/train/train_bc_gru.py \
 2. 从 `max(warmup_frames, seq_len - 1)` 开始，用 GRU **逐步预测** `targets`（通常为 `ego_a_long`），写回对应列及 `ego_acceleration`（若存在）。
 3. 对整段按预测加速度做前向积分，更新 `ego_pos_x`、`ego_speed` / `ego_v_long` 等（保持与脚本内 `_integrate_longitudinal_x` 一致）。
 
-### 5.5 横向逻辑（`--lateral_mode original_jitter`）
+### 5.5 横向逻辑（`--lateral_mode`）
 
-- 在 `--lane_center_y`（默认 -7.625）处定义车道中心。
-- 从 **横向残差池**采样：`ego_pos_y - lane_center`、以及相对中位数的 `ego_yaw`/`steer` 残差序列；可 `--seed` 控制可复现性。
-- `--lateral_pool_data_dir`：从该目录树构建横向池（默认与 `--data_dir` 相同）。会同时扫描 **`segment_*.csv`（模仿学习清洗输出）** 与符合跟驰规则的 **`driving_data.csv`**。
-- `--lateral_pool_driver`：池仅保留路径中含该 `T*` 的 CSV；若过滤后为空会告警（见脚本内 `WARN`）。
-- `--lane_width`、`--lateral_jitter_limit_ratio`、`--lateral_smooth_window`：对过大残差做平滑/限制（默认超出约 1/4 车道宽时滑动平均）。
+在 `--lane_center_y`（默认 -7.625）处定义车道中心。残差取自 **横向残差池**（`ego_pos_y - lane_center` 及相对中位数的 `ego_yaw`/`steer`）。
+
+- **`--lateral_pool_data_dir`**：从该目录树构建池（默认与 `--data_dir` 相同）；扫描 **`segment_*.csv`** 与符合条件的跟驰 **`driving_data.csv`**。
+- **`--lateral_pool_drivers`**（逗号分隔）：若非空，**仅保留**路径中含这些 `T*` 的 CSV 参与建池（与单司机参数二选一优先级：**多司机列表优先**；仅当该项为空时用下面的单司机筛选）。
+- **`--lateral_pool_driver`**：仅保留单个 `T*` 的 CSV；在 `original_jitter` 下还用于指定从哪名司机池中抽样（也可用场景路径自带的 `T*`，见脚本内逻辑）。
+- **`original_jitter`**：对选定司机的残差序列做随机起点环形抽样，`--seed` 可复现。
+- **`pooled_mean_smooth`**：对 `--lateral_pool_drivers`（或退回仅 `--lateral_pool_driver` 一人）拼接残差序列后做 **`--lateral_smooth_window` 滑动平均**，再与原逻辑一致地大偏差时额外平滑/裁剪；按 `i % L` 铺满每行轨迹（无随机起点）。未指定司机时会告警并保持横向列为原 CSV。
+- **`--lane_width`、`--lateral_jitter_limit_ratio`、`--lateral_smooth_window`**：过大横向残差时的限制与平滑窗口。
 
 ### 5.6 输出
 
 - 与输入相对路径一致的 `driving_data.csv` 树结构，写在 `--out_dir`。
-- `generation_summary.csv`：每个生成文件一行（行数、预测行数、`driver_id`、横向池来源等）。
+- `generation_summary.csv`：每个生成文件一行（行数、`lateral_mode`、`lateral_pool_drivers`、`lateral_pool_driver`、`lateral_source` 等）。
 
 **公共前车场景 + 每人纵向模型示例**（脚本顶部注释）：
 
@@ -274,7 +277,7 @@ for i in $(seq 1 20); do
 done
 ```
 
-含义：**场景（前车）固定为 T12 某次实验**；**纵向**仍用每个 `T{i}` 自己的 GRU；**横向抖动**默认也从 `--data_dir` 下发现的数据建池（若目录只有 T12，则横向也来自 T12）。若需横向也个性化，设置 `--lateral_pool_data_dir` / `--lateral_pool_driver`。
+含义：**场景（前车）固定为 T12 某次实验**；**纵向**仍用每个 `T{i}` 自己的 GRU；**横向抖动**默认也从 `--data_dir` 下发现的数据建池（若目录只有 T12，则横向也来自 T12）。若需横向也个性化，设置 `--lateral_pool_data_dir` / `--lateral_pool_driver`；若要**多名司机合成后再平滑**，使用 `--lateral_pool_drivers` 与 `--lateral_mode pooled_mean_smooth`（典型用法见 `train/generate_typical_following_by_style.py`）。
 
 ---
 
@@ -284,7 +287,8 @@ done
 |------|------|
 | `scripts/cluster_following_style.py` | 根据跟驰特征聚类；`CLUSTER_FEATURES` 含车距、时距、速度/加速度方差及 **加速度/制动强度**（`a>0.2`、`a<-0.2` 下 |a| 的中位数与 75 分位）；k-means 用 `--cluster_dim_weights`（与特征顺序一致，当前 11 维） |
 | `scripts/cluster_following_style_leave_one_out.py` | **留一司机法**：每次去掉一名被试后重跑聚类，与全量基线对比标签；输出 `loo_*.csv` 与 `ANALYSIS.md`（至少 4 名司机） |
-| `scripts/train_bc_following_by_style.py` | 按 `conservative` / `neutral` / `aggressive` 池化多名司机的 `segment_*.csv`，调用 `train_bc_gru.py` 训练三个风格模型 |
+| `train/train_bc_following_by_style.py` | 命令行用 `--conservative` / `--neutral` / `--aggressive` 指定各风格司机列表（逗号分隔），池化 `segment_*.csv` 后调用 `train_bc_gru.py` 训练三个风格模型；单风格至少 2 人才能 `split_within_driver` |
+| `train/generate_typical_following_by_style.py` | 与上面**同一批司机列表**；对每个风格调用 `generate_no_driver_following_outputs.py`，`--lateral_mode pooled_mean_smooth` + `--lateral_pool_drivers`，在固定 `--common_case_dir` 下生成典型轨迹 |
 
 详细参数以各脚本内 `argparse` 为准。
 

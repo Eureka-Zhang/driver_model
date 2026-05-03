@@ -298,9 +298,10 @@ def clean_session(rows, args):
             if _segment_duration(sub) < args.min_segment_duration_sec:
                 diag["too_short"] += 1
                 continue
-            if not _has_meaningful_lead(sub, args.max_useful_headway_m, args.v_min_mps):
-                diag["no_lead"] += 1
-                continue
+            if not getattr(args, "skip_meaningful_lead_check", False):
+                if not _has_meaningful_lead(sub, args.max_useful_headway_m, args.v_min_mps):
+                    diag["no_lead"] += 1
+                    continue
             final.append(sub)
             diag["kept"] += 1
     return final, diag
@@ -324,6 +325,11 @@ def main():
                     help="Sample-to-sample ego position jump above this is treated as a glitch")
     ap.add_argument("--max_useful_headway_m", type=float, default=200.0)
     ap.add_argument("--max_files", type=int, default=0)
+    ap.add_argument(
+        "--skip_meaningful_lead_check",
+        action="store_true",
+        help="Keep segments even when lead appears absent (e.g. overtaking lane-change windows).",
+    )
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)

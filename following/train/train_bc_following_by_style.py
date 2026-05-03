@@ -2,20 +2,23 @@
 """
 Train one BC-GRU per following *style* (conservative / neutral / aggressive).
 
-Reads driver → style assignments from ``driver_following_style_clusters.csv`` (from
-cluster_following_style.py), pools all segment CSVs for drivers in that style, and
-trains with the same hyperparameters as per-driver runs (split_within_driver).
+You **manually assign** which drivers belong to each style via comma-separated
+``--conservative`` / ``--neutral`` / ``--aggressive`` lists. For each non-empty
+style, all ``segment_*.csv`` under ``--data_dir`` for those drivers are pooled and
+``train_bc_gru.py`` is run with ``split_within_driver`` (same as per-driver runs).
 
-Example:
-  python3 scripts/train_bc_following_by_style.py \\
-    --cluster_csv outputs/following_style_clusters/driver_following_style_clusters.csv \\
-    --data_dir outputs/following_il_clean_gap04 \\
-    --out_root outputs/il_bc_gru_by_style
+Example::
+
+  python3 following/train/train_bc_following_by_style.py \
+    --conservative T2,T9,T16 \
+    --neutral T7,T10,T20 \
+    --aggressive T3,T5,T6,T8,T19 \
+    --data_dir following/outputs/following_il_clean_gap04 \
+    --out_root following/outputs/il_bc_gru_by_style
 """
 from __future__ import print_function
 
 import argparse
-import csv
 import os
 import subprocess
 import sys
@@ -34,39 +37,55 @@ def _sort_driver_ids(ids):
     return sorted(ids, key=keyf)
 
 
-def _drivers_by_style(cluster_csv):
-    by_style = {s: [] for s in STYLES}
-    with open(cluster_csv, "r", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            sty = (row.get("style_label") or "").strip().lower()
-            did = (row.get("driver_id") or "").strip()
-            if sty in by_style and did:
-                by_style[sty].append(did)
-    return by_style
+def _parse_driver_list(s):
+    """Split comma-separated driver ids; dedupe; sort T* numerically."""
+    if not s:
+        return []
+    parts = [x.strip() for x in s.split(",") if x.strip()]
+    seen = []
+    for p in parts:
+        if p not in seen:
+            seen.append(p)
+    return _sort_driver_ids(seen)
 
 
 def main():
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Train BC-GRU per style using explicit driver lists per style.",
+    )
     ap.add_argument(
-        "--cluster_csv",
+        "--conservative",
         type=str,
-        default=os.path.join(root, "outputs/following_style_clusters/driver_following_style_clusters.csv"),
+        default="",
+        help="Comma-separated driver ids for conservative style (e.g. T1,T2,T3).",
+    )
+    ap.add_argument(
+        "--neutral",
+        type=str,
+        default="",
+        help="Comma-separated driver ids for neutral style.",
+    )
+    ap.add_argument(
+        "--aggressive",
+        type=str,
+        default="",
+        help="Comma-separated driver ids for aggressive style.",
     )
     ap.add_argument(
         "--data_dir",
         type=str,
-        default=os.path.join(root, "outputs/following_il_clean_gap04"),
+        default=os.path.join(root, "outputs", "following_il_clean_gap04"),
     )
     ap.add_argument(
         "--out_root",
         type=str,
-        default=os.path.join(root, "outputs/il_bc_gru_by_style"),
+        default=os.path.join(root, "outputs", "il_bc_gru_by_style"),
     )
     ap.add_argument(
         "--train_bc",
         type=str,
-        default=os.path.join(root, "train/train_bc_gru.py"),
+        default=os.path.join(root, "train", "train_bc_gru.py"),
     )
     ap.add_argument("--seq_len", type=int, default=20)
     ap.add_argument("--epochs", type=int, default=60)
@@ -75,13 +94,43 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
-    by_style = _drivers_by_style(args.cluster_csv)
+    by_style = {
+        "conservative": _parse_driver_list(args.conservative),
+        "neutral": _parse_driver_list(args.neutral),
+        "aggressive": _parse_driver_list(args.aggressive),
+    }
+
+    if not any(by_style[s] for s in STYLES):
+        ap.error(
+            "Provide at least one non-empty --conservative, --neutral, or --aggressive list."
+        )
+
+    driver_to_styles = {}
+    for sty in STYLES:
+        for d in by_style[sty]:
+            driver_to_styles.setdefault(d, []).append(sty)
+    dup = {d: st for d, st in driver_to_styles.items() if len(st) > 1}
+    if dup:
+        for d, st_list in sorted(dup.items()):
+            print(
+                "[WARN] driver {} appears in multiple styles: {} (each style trains a separate model; data may overlap).".format(
+                    d, ", ".join(st_list)
+                )
+            )
+
     os.makedirs(args.out_root, exist_ok=True)
 
     for sty in STYLES:
-        drivers = _sort_driver_ids(list(set(by_style[sty])))
+        drivers = by_style[sty]
+        if not drivers:
+            print("[SKIP] style={} empty (no --{} given).".format(sty, sty))
+            continue
         if len(drivers) < 2:
-            print("[SKIP] style={} only {} driver(s); need >=2 for split_within_driver.".format(sty, len(drivers)))
+            print(
+                "[SKIP] style={} only {} driver(s) {}; need >=2 for split_within_driver.".format(
+                    sty, len(drivers), drivers
+                )
+            )
             continue
         ds = ",".join(drivers)
         out_dir = os.path.join(args.out_root, sty)
