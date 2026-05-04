@@ -18,10 +18,10 @@ Requires at least **4** drivers so that each LOO fold still has **>= 3** subject
 
 Example::
 
-  python3 following/scripts/cluster_following_style_leave_one_out.py \\
-    --data_dir following/outputs/following_il_clean_gap04 \\
-    --out_dir following/outputs/following_style_loo \\
-    --seed 42
+  python3 following/scripts/cluster_following_style_leave_one_out.py \
+    --data_dir following/outputs/following_il_clean_gap04 \
+    --out_dir following/outputs/following_style_loo_outputs_test \
+    --seed 1
 """
 from __future__ import print_function
 
@@ -75,7 +75,7 @@ def main():
     ap.add_argument(
         "--cluster_dim_weights",
         type=str,
-        default="2,1,1,1,1,1,1,1,1,1,1",
+        default="1,1,1,1,1,1,1,1,1,1,1,1",
         help="Same as cluster_following_style.py --cluster_dim_weights.",
     )
     ap.add_argument("--seed", type=int, default=42)

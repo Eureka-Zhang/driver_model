@@ -10,9 +10,9 @@ style, all ``segment_*.csv`` under ``--data_dir`` for those drivers are pooled a
 Example::
 
   python3 following/train/train_bc_following_by_style.py \
-    --conservative T2,T9,T16 \
-    --neutral T7,T10,T20 \
-    --aggressive T3,T5,T6,T8,T19 \
+    --conservative T9,T16 \
+    --neutral T1,T3,T7,T15,T20 \
+    --aggressive T4,T6,T11,T12 \
     --data_dir following/outputs/following_il_clean_gap04 \
     --out_root following/outputs/il_bc_gru_by_style
 """

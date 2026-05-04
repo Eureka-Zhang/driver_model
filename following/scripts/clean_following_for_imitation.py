@@ -8,23 +8,25 @@ Design principles tailored to behaviour cloning of car-following:
   smooth or interpolate them. We may DROP rows or SPLIT segments, never edit values.
 - Treat all lead_* / distance_headway / time_headway / relative_speed / ttc as the
   recorded leading-vehicle situation that we must reproduce exactly during replay,
-  so we keep them untouched (only mask sentinel 999).
-- Keep the data as a list of contiguous SEGMENTS so the model is only trained on
-  truly continuous time series; gaps from simulator stalls do not get glued
-  together silently.
+  so we keep them untouched (including sentinel 999 for THW/TTC); we do **not**
+  emit ``ttc_valid`` / ``time_headway_valid``.
+- Emitted features (not from raw log): ``inv_ttc``, ``inv_time_headway`` are ``1/ttc`` and
+  ``1/time_headway`` when those values are finite and positive and not the ``999`` sentinel;
+  otherwise **0** (avoids ``1/999`` and unbounded inverses).
 
 Pipeline:
   1. Drop rows missing any essential field.
   2. Sort by timestamp; drop duplicates / non-monotonic rows.
-  3. Mask sentinel 999 in ttc / time_headway -> empty + boolean *_valid column.
+  3. Preserve ``ttc`` / ``time_headway`` verbatim (sentinel ``999`` kept); do not add
+     ``*_valid`` columns here.
   4. Split into contiguous segments where dt <= gap_threshold_sec.
   5. Trim leading and trailing "stationary / no-interaction" rows
      (both ego and lead under v_min for too long).
   6. Drop segments shorter than min_segment_duration_sec.
   7. Drop rows whose physical signals are impossible (huge instantaneous jumps);
      segment is split at those locations.
-  8. Drop segments where the lead is essentially absent throughout
-     (distance_headway always above max_useful_headway and lead_speed ~ 0).
+  9. Per row: add ``inv_ttc``, ``inv_time_headway`` (reciprocals, 0 when ``ttc``/``time_headway``
+     is ``999`` or invalid).
 
 Output layout (mirrors data/):
   <out_dir>/T*/行车/<session>/segment_001.csv, segment_002.csv, ...
@@ -32,8 +34,8 @@ Output layout (mirrors data/):
   <out_dir>/cleaning_dropped.csv          - one row per dropped source file
   
   python3 /home/zwx/driver_model/following/scripts/clean_following_for_imitation.py \
-  --data_dir /home/zwx/driver_model/following/outputs/following_calibrated/T9 \
-  --out_dir /home/zwx/driver_model/following/outputs/following_il_clean_gap04/T9
+  --data_dir /home/zwx/driver_model/following/outputs/following_calibrated \
+  --out_dir /home/zwx/driver_model/following/outputs/following_il_clean_gap04
   
 """
 from __future__ import print_function
@@ -58,6 +60,9 @@ ESSENTIAL_FIELDS = [
     "lead_speed",
     "distance_headway",
 ]
+
+# Appended on write: reciprocals with 0 when ttc/thw is ~999 sentinel.
+COLLISION_INVERSE_FIELDS = ("inv_ttc", "inv_time_headway")
 
 
 def _parse_float(s):
@@ -91,18 +96,36 @@ def discover_following_csvs(data_dir):
     return sorted(cands)
 
 
-def _normalize_sentinels(rows):
-    """ttc / time_headway with value 999 are sentinels for 'no lead in front';
-    convert them to empty and add *_valid columns (Yes/No)."""
+def _strip_ttc_thw_valid_columns(rows):
+    """Remove optional *_valid keys from rows; output CSV excludes these columns."""
     for r in rows:
-        for k in ("ttc", "time_headway"):
-            v = _parse_float(r.get(k))
-            if v is not None and abs(v - 999.0) < 1e-6:
-                r[k] = ""
-                r[k + "_valid"] = "0"
-            else:
-                r[k + "_valid"] = "1" if v is not None else "0"
+        r.pop("ttc_valid", None)
+        r.pop("time_headway_valid", None)
     return rows
+
+
+_SENTINEL_999_TOL = 1e-3
+
+
+def _reciprocal_thw_or_zero(cell):
+    """
+    Return 1/x for finite x>0 that is not the ~999 sentinel; else 0 (no inf from 1/999).
+    """
+    x = _parse_float(cell)
+    if x is None or not math.isfinite(x) or x <= 0.0:
+        return 0.0
+    if abs(x - 999.0) < _SENTINEL_999_TOL:
+        return 0.0
+    return 1.0 / x
+
+
+def _annotate_collision_inverse_fields(row):
+    """Add inv_ttc, inv_time_headway to row for CSV output (mutates row)."""
+    inv_t = _reciprocal_thw_or_zero(row.get("ttc"))
+    inv_h = _reciprocal_thw_or_zero(row.get("time_headway"))
+    row["inv_ttc"] = "{:.9f}".format(inv_t)
+    row["inv_time_headway"] = "{:.9f}".format(inv_h)
+    return row
 
 
 def _drop_missing_essentials(rows):
@@ -273,7 +296,7 @@ def clean_session(rows, args):
     """
     rows = _drop_missing_essentials(rows)
     rows = _sort_dedup_monotonic(rows)
-    rows = _normalize_sentinels(rows)
+    rows = _strip_ttc_thw_valid_columns(rows)
 
     base_segs = _split_by_time_gap(rows, args.gap_threshold_sec)
     diag = {
@@ -352,11 +375,10 @@ def main():
             dropped.append({"file": rel, "reason": "no_header"})
             continue
 
-        added_fields = []
-        for k in ("ttc_valid", "time_headway_valid"):
-            if k not in fieldnames:
-                added_fields.append(k)
-        out_fields = fieldnames + added_fields
+        out_fields = [fn for fn in fieldnames if fn not in ("ttc_valid", "time_headway_valid")]
+        for _fn in COLLISION_INVERSE_FIELDS:
+            if _fn not in out_fields:
+                out_fields.append(_fn)
 
         segments, diag = clean_session(rows, args)
         diagnostics.append({
@@ -384,9 +406,7 @@ def main():
                 w = csv.DictWriter(f, fieldnames=out_fields)
                 w.writeheader()
                 for r in seg:
-                    for k in added_fields:
-                        if k not in r:
-                            r[k] = ""
+                    _annotate_collision_inverse_fields(r)
                     w.writerow(r)
 
             t0 = _parse_float(seg[0].get("timestamp")) or 0.0

@@ -2,6 +2,19 @@
 """
 Train a GRU behavior-cloning policy for car-following imitation learning.
 
+Feature parsing lives in ``bc_gru_features.py`` (same module used by rollout generators).
+
+Input feature vector per timestep (order matches ``DEFAULT_FEATURES``):
+
+  - ``dt_prev``: current ``timestamp`` − previous (0 on first row)
+  - ``ego_v_long``: from CSV or alias ``ego_speed``
+  - ``ego_a_long``
+  - ``distance_headway``
+  - ``relative_v_long`` (alias ``relative_speed``, or ``lead − ego`` long speeds)
+  - ``lead_v_long``
+  - ``inv_ttc``: reciprocal of ``ttc``, **0** when ``ttc≈999`` or invalid (``ttc_inverse`` alias)
+  - ``inv_time_headway``: reciprocal of ``time_headway``, **0** when sentinel/invalid
+
 Input data layout:
   <data_dir>/T*/行车/<session>/segment_XXX.csv
 
@@ -49,39 +62,24 @@ import math
 import os
 import random
 import re
+import sys
 
 import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 
-DEFAULT_FEATURES = [
-    "dt_prev",
-    "ego_v_long",
-    "ego_a_long",
-    "distance_headway",
-    "relative_v_long",
-    "lead_v_long",
-    "ttc",
-    "ttc_valid",
-    "time_headway",
-    "time_headway_valid",
-]
-
-DEFAULT_TARGETS = ["ego_a_long"]
-
-
-def _parse_float(v):
-    if v is None:
-        return None
-    s = str(v).strip()
-    if not s:
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
+from bc_gru_features import (
+    DEFAULT_FEATURES,
+    DEFAULT_TARGETS,
+    _parse_float,
+    features_at_timestep,
+    hydrate_bc_gru_row_aliases,
+)
 
 
 def _discover_segment_csvs(data_dir):
@@ -104,23 +102,12 @@ def _extract_driver_id(path):
     return "UNKNOWN"
 
 
-def _row_value(row, key):
-    if key in row:
-        return _parse_float(row.get(key))
-    if key == "relative_speed":
-        lv = _parse_float(row.get("lead_speed"))
-        ev = _parse_float(row.get("ego_speed"))
-        if lv is None or ev is None:
-            return None
-        return lv - ev
-    return None
-
-
 def _build_segment_arrays(csv_path, features, targets):
     rows = []
     with open(csv_path, "r", encoding="utf-8") as f:
         for r in csv.DictReader(f):
-            rows.append(r)
+            rows.append(dict(r))
+    rows = [hydrate_bc_gru_row_aliases(r) for r in rows]
     if not rows:
         return None, None
 
@@ -129,29 +116,11 @@ def _build_segment_arrays(csv_path, features, targets):
     x = []
     y = []
     for i, r in enumerate(rows):
-        fv = []
-        ok = True
-        for k in features:
-            if k == "dt_prev":
-                if i == 0:
-                    v = 0.0
-                else:
-                    t0 = ts[i - 1]
-                    t1 = ts[i]
-                    if t0 is None or t1 is None:
-                        v = None
-                    else:
-                        # Explicitly provide per-frame elapsed time to handle non-uniform sampling.
-                        v = max(0.0, t1 - t0)
-            else:
-                v = _row_value(r, k)
-            if v is None:
-                ok = False
-                break
-            fv.append(v)
-        if not ok:
+        fv = features_at_timestep(rows, ts, i, features)
+        if fv is None:
             continue
         tv = []
+        ok = True
         for k in targets:
             v = _parse_float(r.get(k))
             if v is None:

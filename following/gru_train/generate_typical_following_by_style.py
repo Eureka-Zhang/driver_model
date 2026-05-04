@@ -2,6 +2,9 @@
 """
 Generate *typical* longitudinal trajectories for each driving style on a fixed scenario.
 
+- Longitudinal rollout uses ``generate_no_driver_following_outputs.py`` (shared
+  ``bc_gru_features`` with ``train_bc_gru.py``, **closed-loop** GRU + kinematic headway).
+
 - Longitudinal: BC-GRU checkpoint under ``model_root/<style>/`` (or ``--single_model_dir``).
 - Scenario: fixed lead / world from ``--common_case_dir``.
 - Lateral: **merged + moving-average jitter** via ``generate_no_driver_following_outputs.py``
@@ -10,7 +13,7 @@ Generate *typical* longitudinal trajectories for each driving style on a fixed s
 
 Example::
 python3 following/train/generate_typical_following_by_style.py \
-  --conservative T2,T9,T16 --neutral T7,T10,T20 --aggressive T3,T5,T6,T8,T19 \
+  --conservative T9,T16 --neutral T1,T3,T7,T15,T20 --aggressive T4,T6,T11,T12 \
   --model_root following/outputs/il_bc_gru_by_style \
   --lateral_pool_root following/outputs/following_il_clean_gap04 \
   --common_case_dir data/T12/行车/20260421_120610_198_exp1_f \

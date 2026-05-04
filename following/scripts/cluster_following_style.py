@@ -10,19 +10,19 @@ features. Pedal-only signals are not used for clustering.
 Preferred input:
   outputs/following_il_clean_gap04 produced from the latest calibrated data.
 
-Row-level fields used (with fallbacks for older CSVs):
-  distance_headway, time_headway
-  relative_v_long  (else lead_speed - ego_speed; uses ego_v_long / lead_v_long when present)
-  ego_a_long       (else ego_acceleration)
-  lead_a_long      (else lead_acceleration)
-  acc_diff := lead_long - ego_long   (summarized per driver)
+Row-level longitudinal signals:
+  ego / lead speeds (ego_v_long or ego_speed, etc.)
+  distance_headway, time_headway (time_headway may be missing → computed from headway/max(ego_v, eps))
+  TTC **not** taken from CSV: ``headway/(ego_v − lead_v)`` when ego is catching up (>1e−2 m/s).
+  Clustering uses **percentiles of** ``1/time_headway`` and ``1/TTC`` (1/s-style tightness / closing intensity),
+  not raw THW/TTC durations.
+  jerk (longitudinal ``ego_a_long`` / ``ego_acceleration`` differentiated w.r.t. ``timestamp``, |j| summarized).
 
 K-means uses **weighted** squared distance on z-scored features:
   sum_j w_j (z_ij - c_kj)^2
-See ``--cluster_dim_weights`` (default aligns with ``CLUSTER_FEATURES``, including
-gap/time-gap/headway_mean/variance plus accel/decel magnitude medians/p75 — see script).
-Style naming (conservative / neutral / aggressive) still uses the separate heuristic
-in code, not these weights.
+See ``--cluster_dim_weights`` (default aligns with ``CLUSTER_FEATURES_ENHANCED`` / ``CLUSTER_FEATURES``).
+Style naming (conservative / neutral / aggressive) uses a separate z-score heuristic with
+**positive-only** coefficients (conservative cues enter as ``-z``).
 
 Also writes following_style_prototypes.json: one prototype driver per style (closest to
 centroid in the same weighted metric) for typical lateral residual replay.
@@ -35,8 +35,8 @@ Visualization (optional):
     --data_dir following/outputs/following_il_clean_gap04 \
     --out_dir following/outputs/following_style_clusters \
     --plot \
-    --cluster_dim_weights 1,1,1,1,1,1,1 \
-    --plot_path following/outputs/following_style_clusters/my_pca2.png
+    --cluster_dim_weights 1,1,1,1,1,1,1,1,1,1,1,1 \
+    --plot_path following/outputs/following_style_clusters/my_pca.png
 """
 from __future__ import print_function
 
@@ -142,47 +142,167 @@ def _row_features(row):
     }
 
 
+def _thw_csv_usable(th_csv):
+    if th_csv is None:
+        return False
+    if not math.isfinite(float(th_csv)):
+        return False
+    if abs(float(th_csv) - 999.0) <= 1e-3:
+        return False
+    return float(th_csv) > 1e-4 and float(th_csv) < 500.0
+
+
+def _effective_time_headway_csv_or_compute(row, headway_m, ego_v):
+    """Use CSV ``time_headway`` when usable; otherwise ``distance_headway / ego_v`` (mirror collector)."""
+    th_raw = _parse_float(row.get("time_headway"))
+    if _thw_csv_usable(th_raw):
+        return float(th_raw)
+    if headway_m is None or ego_v < 0.5:
+        return None
+    if headway_m < 300.0:
+        return float(headway_m) / float(ego_v)
+    return None
+
+
+def _closing_ttc_from_longitudinal(distance_m, ego_v_long, lead_v_long):
+    """
+    Longitudinal TTC from kinematics (**not CSV ``ttc``**):
+
+    ``distance_headway / (ego_v − lead_v)`` when ego is approaching the lead (>1e−2 m/s).
+    Mirrors ``replay/experiment.DataCollector`` logic.
+    """
+    if distance_m is None:
+        return None
+    dh = float(distance_m)
+    if not math.isfinite(dh) or dh <= 1e-3 or dh >= 300.0:
+        return None
+    dv = float(ego_v_long) - float(lead_v_long)
+    if not math.isfinite(dv) or dv <= 1e-2:
+        return None
+    t = dh / dv
+    if not math.isfinite(t) or t <= 0.0:
+        return None
+    return min(t, 999.0)
+
+
+def _central_derivative(times, vals):
+    n = len(times)
+    if n == 0:
+        return []
+    out = [0.0] * n
+    if n >= 3:
+        for i in range(1, n - 1):
+            dt = times[i + 1] - times[i - 1]
+            if dt > 1e-12:
+                out[i] = (vals[i + 1] - vals[i - 1]) / dt
+    if n >= 2:
+        dt = times[1] - times[0]
+        if dt > 1e-12:
+            out[0] = (vals[1] - vals[0]) / dt
+        dt = times[-1] - times[-2]
+        if dt > 1e-12:
+            out[-1] = (vals[-1] - vals[-2]) / dt
+    return out
+
+
 def _summarize_driver(paths):
     ego_v = []
     rel_v_signed = []
     rel_v_abs = []
+    rel_v_gap_ego_minus_lead = []
     acc = []
     acc_abs = []
     acc_diff = []
     acc_diff_abs = []
     headway = []
-    time_headway = []
+    time_headway_effective = []
     throttle = []
     brake = []
+    jerk_abs_samples = []
+
+    ttc_positive_closing_samples = []
 
     rows = 0
+    thw_known_count = 0
+    thw_lt_1s_count = 0
+
     for fp in paths:
+        seg_times = []
+        seg_acc = []
+
         with open(fp, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
+                ts = _parse_float(row.get("timestamp"))
                 r = _row_features(row)
-                rows += 1
+
                 ego_v.append(r["ego_v"])
                 rel_v_signed.append(r["rel_v"])
                 rel_v_abs.append(abs(r["rel_v"]))
+                rel_v_gap_ego_minus_lead.append(float(r["ego_v"]) - float(r["lead_v"]))
+
                 acc.append(r["ego_a"])
                 acc_abs.append(abs(r["ego_a"]))
                 acc_diff.append(r["acc_diff"])
                 acc_diff_abs.append(abs(r["acc_diff"]))
-                if r["headway"] is not None and r["headway"] < 300:
-                    headway.append(r["headway"])
-                if (
-                    r["time_headway"] is not None
-                    and r["time_headway"] < 50
-                    and abs(r["time_headway"] - 999.0) > 1e-6
-                ):
-                    time_headway.append(r["time_headway"])
+
+                hw = r["headway"]
+
+                thaw = None
+                if hw is not None and hw < 300.0:
+                    headway.append(hw)
+                    thaw = _effective_time_headway_csv_or_compute(row, hw, float(r["ego_v"]))
+
+                if thaw is not None and math.isfinite(thaw):
+                    time_headway_effective.append(thaw)
+                    thw_known_count += 1
+                    if thaw < 1.0:
+                        thw_lt_1s_count += 1
+
+                tty = None
+                if hw is not None:
+                    tty = _closing_ttc_from_longitudinal(hw, float(r["ego_v"]), float(r["lead_v"]))
+                if tty is not None:
+                    ttc_positive_closing_samples.append(tty)
+
                 throttle.append(r["throttle"])
                 brake.append(r["brake"])
+                rows += 1
+
+                if ts is not None:
+                    seg_times.append(ts)
+                    seg_acc.append(float(r["ego_a"]))
+
+        if len(seg_times) >= 2:
+            jerk_vec = _central_derivative(seg_times, seg_acc)
+            for ji in jerk_vec:
+                if math.isfinite(float(ji)):
+                    jerk_abs_samples.append(abs(float(ji)))
 
     positive_acc = [x for x in acc if x > 0.2]
     negative_acc_abs = [abs(x) for x in acc if x < -0.2]
     brake_active = [1.0 if x > 0.02 else 0.0 for x in brake]
     throttle_active = [1.0 if x > 0.05 else 0.0 for x in throttle]
+
+    thw_less_1s_ratio = float(thw_lt_1s_count) / float(thw_known_count) if thw_known_count > 0 else 0.0
+
+    inv_time_headway_samples = []
+    for t in time_headway_effective:
+        if t is not None and float(t) > 1e-9:
+            inv_time_headway_samples.append(1.0 / float(t))
+
+    inv_ttc_samples = []
+    for tty in ttc_positive_closing_samples:
+        if tty is not None and float(tty) > 1e-9:
+            inv_ttc_samples.append(1.0 / float(tty))
+
+    # Legacy single-stat export (seconds); clustering uses inverse percentiles below.
+    if ttc_positive_closing_samples:
+        ttc_p05 = _percentile(ttc_positive_closing_samples, 5)
+    else:
+        ttc_p05 = 999.0
+
+    jerk_abs_p75 = _percentile(jerk_abs_samples, 75) if jerk_abs_samples else 0.0
+    rel_v_std = _std(rel_v_gap_ego_minus_lead)
 
     return {
         "n_rows": rows,
@@ -193,8 +313,14 @@ def _summarize_driver(paths):
         "headway_mean": _mean(headway),
         "headway_median": _percentile(headway, 50),
         "headway_p25": _percentile(headway, 25),
-        "time_headway_median": _percentile(time_headway, 50),
-        "time_headway_p25": _percentile(time_headway, 25),
+        "time_headway_median": _percentile(time_headway_effective, 50),
+        "time_headway_p25": _percentile(time_headway_effective, 25),
+        "inv_time_headway_p25": _percentile(inv_time_headway_samples, 25),
+        "inv_time_headway_median": _percentile(inv_time_headway_samples, 50),
+        "thw_less_1s_ratio": float(thw_less_1s_ratio),
+        "ttc_p05": float(ttc_p05),
+        "inv_ttc_p50": _percentile(inv_ttc_samples, 50),
+        "inv_ttc_p95": _percentile(inv_ttc_samples, 95),
         "relative_v_mean": _mean(rel_v_signed),
         "relative_v_std": _std(rel_v_signed),
         "relative_v_abs_mean": _mean(rel_v_abs),
@@ -210,6 +336,8 @@ def _summarize_driver(paths):
         "accel_abs_p75": _percentile(positive_acc, 75),
         "decel_abs_median": _percentile(negative_acc_abs, 50),
         "decel_abs_p75": _percentile(negative_acc_abs, 75),
+        "jerk_abs_p75": float(jerk_abs_p75),
+        "rel_v_std": float(rel_v_std),
         "positive_acc_mean": _mean(positive_acc),
         "decel_abs_mean": _mean(negative_acc_abs),
         "throttle_mean": _mean(throttle),
@@ -293,24 +421,27 @@ def _pca2(zpoints):
     return proj, var_frac
 
 
-CLUSTER_FEATURES = [
+CLUSTER_FEATURES_ENHANCED = [
     "headway_median",
     "headway_p25",
-    "time_headway_median",
-    "time_headway_p25",
-    "headway_mean",
+    "inv_time_headway_p25",
+    "inv_time_headway_median",
+    "inv_ttc_p50",
+    "inv_ttc_p95",
     "ego_v_var",
-    "acc_var",
-    # Ego longitudinal: meaningful accel (m/s^2, a>0.2) and decel (|a| for a<-0.2)
     "accel_abs_median",
     "accel_abs_p75",
     "decel_abs_median",
     "decel_abs_p75",
+    "jerk_abs_p75",
 ]
 
 
+CLUSTER_FEATURES = CLUSTER_FEATURES_ENHANCED
+
+
 def parse_cluster_dim_weights(s):
-    """Parse comma-separated positive weights; length must match CLUSTER_FEATURES."""
+    """Parse comma-separated positive weights; length must match ``CLUSTER_FEATURES``."""
     dim_weights = [float(x.strip()) for x in s.split(",") if str(x).strip()]
     if len(dim_weights) != len(CLUSTER_FEATURES):
         raise RuntimeError(
@@ -358,18 +489,20 @@ def assign_kmeans_styles(rows, dim_weights, seed):
         for i in idxs:
             p = points[i]
             f = dict(zip(cluster_features, p))
+            # Aggressiveness ↑: all coefficients positive (conservative-oriented z features enter as -z).
             score += (
-                -1.0 * f["time_headway_median"]
-                -1.0 * f["time_headway_p25"]
-                -1.0 * f["headway_median"]
-                -0.9 * f["headway_p25"]
-                -0.8 * f["headway_mean"]
-                +1.0 * f["ego_v_var"]
-                +1.0 * f["acc_var"]
-                +0.5 * f["accel_abs_median"]
-                +0.5 * f["accel_abs_p75"]
-                +0.5 * f["decel_abs_median"]
-                +0.5 * f["decel_abs_p75"]
+                1.0 * (-f["headway_median"])
+                + 0.95 * (-f["headway_p25"])
+                + 0.9 * f["inv_time_headway_p25"]
+                + 1.0 * f["inv_time_headway_median"]
+                + 1.0 * f["inv_ttc_p50"]
+                + 0.95 * f["inv_ttc_p95"]
+                + 1.0 * f["ego_v_var"]
+                + 0.5 * f["accel_abs_median"]
+                + 0.5 * f["accel_abs_p75"]
+                + 0.5 * f["decel_abs_median"]
+                + 0.5 * f["decel_abs_p75"]
+                + 0.5 * f["jerk_abs_p75"]
             )
         cluster_scores[lab] = score / float(len(idxs))
     ordered = sorted(cluster_scores.keys(), key=lambda x: cluster_scores[x])
@@ -467,7 +600,7 @@ def _save_cluster_plot(rows, zpoints, out_path):
     pct1 = 100.0 * var_frac[1] if len(var_frac) > 1 else 0.0
     ax.set_xlabel("PC1 ({:.0f}% variance)".format(pct0))
     ax.set_ylabel("PC2 ({:.0f}% variance)".format(pct1))
-    ax.set_title("Car-following style clusters (PCA on z-scored gap + variance features)")
+    ax.set_title("Car-following style clusters (PCA on z-scored CLUSTER_FEATURES_ENHANCED)")
     ax.grid(True, linestyle="--", alpha=0.35)
     ax.legend(loc="best", framealpha=0.9)
     fig.tight_layout()
@@ -503,13 +636,11 @@ def main():
     ap.add_argument(
         "--cluster_dim_weights",
         type=str,
-        default="2,1,1,1,1,1,1,1,1,1,1",
+        default="1,1,1,1,1,1,1,1,1,1,1,1",
         help=(
             "Comma-separated positive weights for k-means / prototype distance on z-scored "
-            "features, order: headway_median, headway_p25, time_headway_median, "
-            "time_headway_p25, headway_mean, ego_v_var, acc_var, "
-            "accel_abs_median, accel_abs_p75, decel_abs_median, decel_abs_p75 "
-            "(accel/decel use samples with a>0.2 / a<-0.2 on ego longitudinal a)."
+            "features, order: "
+            + ", ".join(CLUSTER_FEATURES)
         ),
     )
     args = ap.parse_args()
@@ -541,6 +672,14 @@ def main():
         "n_segments",
         "n_rows",
     ] + cluster_features + [
+        "time_headway_median",
+        "time_headway_p25",
+        "ttc_p05",
+        "thw_less_1s_ratio",
+        "rel_v_std",
+        "headway_mean",
+        "acc_var",
+        "relative_v_std",
         "positive_acc_mean",
         "decel_abs_mean",
         "relative_v_mean",

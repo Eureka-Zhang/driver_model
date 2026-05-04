@@ -25,6 +25,9 @@ Discovery: ``exp[123]_o``, exclude ``pre_familiarization`` / ``_b``.
 
 可选写出 ``phase_01_following.csv`` … 或整文件索引 ``phase_segments_summary.csv``。
 
+**合法四段会话**可在 ``out_dir`` 下按源目录镜像复制**未切分**的 ``driving_data.csv``，
+与相位切片同级（``shutil.copy2``，默认开启；使用 ``--no_copy_source_driving_csv`` 关闭）。
+
 默认 **``--save_figures``**：为每个实验生成 ``figures/<镜像路径>/session_phases.png``（全轨迹 ``ego_pos_y``、
 车道带、四阶段底色、跟驰/左道超车段的轮迹压线点；**图内文字为英文**），并写 ``figures/index.html``。
 压线判定与 ``filter_following_right_lane`` 一致：车体中心 ``ego_pos_y`` + ``ego_half_width_m``。
@@ -32,11 +35,12 @@ Discovery: ``exp[123]_o``, exclude ``pre_familiarization`` / ``_b``.
 Example::
 
   python3 overtaking/scripts/segment_overtaking_phases.py \
-    --data_dir overtaking/selected_p1p3_lateral \
-    --out_dir overtaking/outputs/overtaking_phase_segments \
-    --right_y_min -9.30 --right_y_max -5.75 --p2_end_mode fixed --y_center_p2_end -4 --ego_half_width_m 0.9 \
+    --data_dir overtaking/outputs/p1p3_lateral_all \
+    --out_dir overtaking/outputs/overtaking_phase_segments_all_p1p3 \
+    --right_y_min -9.30 --right_y_max -5.75 --p2_end_mode fixed --y_center_p2_end -4.6 --ego_half_width_m 0.9 \
     --segment_smooth_window 5 --edge_eps_m 0.08 --center_hold_sec 0.15 \
-    --write_segment_csv
+    --write_segment_csv \
+    --no_copy_source_driving_csv
 
   # P2 end when center equals R wheel on inner line: right_y_max + hw
   # python3 ... --p2_end_mode geometry --right_y_max -5.75 --ego_half_width_m 0.9
@@ -47,6 +51,7 @@ import argparse
 import csv
 import os
 import re
+import shutil
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -252,6 +257,43 @@ def segment_indices(
         "y_p2_end": ref_y,
         "status": "ok",
     }
+
+
+def four_phases_all_non_empty(out, n):
+    """
+    Require ``status == 'ok'`` and **no zero-length phase** among P1–P4.
+
+    Phases: ``P1=[0,i1), P2=[i1,B), P3=[B,i3), P4=[i3,n)``. Lengths are
+    ``len(P1)=i1``, ``len(P2)=B-i1``, ``len(P3)=i3-B``, ``len(P4)=n-i3``;
+    all must be ``>= 1``, i.e. ``0 < i1 < B < i3 < n``.
+
+    Returns ``(ok, detail)`` where ``detail`` is empty if ok, else a short reason for logging.
+    """
+    st = out.get("status")
+    i1 = out.get("i_follow_end")
+    i_reach = out.get("i_reach")
+    i3 = out.get("i_left_end")
+    if st == "never_center_y_lane_change":
+        return False, "status=never_center_y_lane_change (no P2/P3/P4 boundary B)"
+    if st == "no_r_wheel_rl_inner_edge":
+        return False, "status=no_r_wheel_rl_inner_edge (no P4 boundary)"
+    if st != "ok":
+        return False, "status={}".format(st)
+    if i_reach is None:
+        return False, "i_reach is None"
+    try:
+        i1, i_reach, i3 = int(i1), int(i_reach), int(i3)
+    except (TypeError, ValueError):
+        return False, "non-int boundaries i1={!r} B={!r} i3={!r}".format(i1, i_reach, i3)
+    lp1, lp2, lp3, lp4 = i1, i_reach - i1, i3 - i_reach, n - i3
+    if lp1 < 1 or lp2 < 1 or lp3 < 1 or lp4 < 1:
+        return False, (
+            "zero-length phase not allowed: n={} i1={} B={} i3={} "
+            "len_P1={} len_P2={} len_P3={} len_P4={}".format(
+                n, i1, i_reach, i3, lp1, lp2, lp3, lp4
+            )
+        )
+    return True, ""
 
 
 def _slice_rows(rows, i0, i1):
@@ -573,7 +615,16 @@ def main():
         dest="save_figures",
         help="Disable PNG figures and figures/index.html.",
     )
-    ap.set_defaults(save_figures=True)
+    ap.add_argument(
+        "--no_copy_source_driving_csv",
+        action="store_false",
+        dest="copy_source_driving_csv",
+        help=(
+            "Do not copy the source driving_data.csv into out_dir/<mirrored>/ for valid four-phase sessions "
+            "(default: copy with shutil.copy2)."
+        ),
+    )
+    ap.set_defaults(save_figures=True, copy_source_driving_csv=True)
     args = ap.parse_args()
 
     if args.y_center_p2_end is not None and args.y_center_lane_change is not None:
@@ -595,6 +646,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     summary = []
     figure_links = []
+    n_skipped_incomplete = 0
 
     for fp in csv_paths:
         rel = os.path.relpath(fp, args.data_dir).replace("\\", "/")
@@ -634,6 +686,17 @@ def main():
             edge_eps_m=args.edge_eps_m,
             center_hold_sec=args.center_hold_sec,
         )
+
+        ok_four, four_detail = four_phases_all_non_empty(out, n)
+        if not ok_four:
+            n_skipped_incomplete += 1
+            print(
+                "[SKIP] 未检出完整四相位（已丢弃）{}  |  {}".format(
+                    rel.replace("/driving_data.csv", "") or rel,
+                    four_detail,
+                )
+            )
+            continue
 
         i1 = out["i_follow_end"]
         i_reach = out.get("i_reach")
@@ -699,6 +762,15 @@ def main():
             }
         )
 
+        session_out_dir = os.path.join(args.out_dir, os.path.dirname(rel))
+        need_session_out_dir = bool(args.copy_source_driving_csv) or (
+            args.write_segment_csv and i_reach is not None and st == "ok"
+        )
+        if need_session_out_dir:
+            os.makedirs(session_out_dir, exist_ok=True)
+        if args.copy_source_driving_csv:
+            shutil.copy2(fp, os.path.join(session_out_dir, "driving_data.csv"))
+
         if args.save_figures:
             sess = os.path.basename(os.path.dirname(fp))
             stem = _sanitize_filename(sess or "session")
@@ -728,10 +800,8 @@ def main():
                 href = os.path.relpath(out_png, idx_root).replace("\\", "/")
                 figure_links.append((href, rel))
 
-        if args.write_segment_csv and i_reach is not None and st in ("ok", "no_r_wheel_rl_inner_edge"):
-            base = os.path.join(args.out_dir, os.path.dirname(rel))
-            if not os.path.isdir(base):
-                os.makedirs(base)
+        if args.write_segment_csv and i_reach is not None and st == "ok":
+            base = session_out_dir
             sess = os.path.basename(os.path.dirname(fp))
             stem = _sanitize_filename(sess or "session")
             segs = [
@@ -792,7 +862,7 @@ def main():
         with open(idx_path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
 
-    print("[OK] files:", len(summary))
+    print("[OK] files:", len(summary), "  skipped_incomplete_four_phases:", n_skipped_incomplete)
     print("[OK] summary:", sum_fp)
     if args.save_figures and figure_links:
         print("[OK] figures index:", os.path.join(args.out_dir, "figures", "index.html"))
