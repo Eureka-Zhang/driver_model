@@ -1,50 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Generate no-driver-intervention following outputs using trained BC-GRU model.
+Generate no-driver-intervention following outputs using trained **BC-TCN** (from ``train_bc_tcn.py``).
 
-This script keeps original CSV columns and row count unchanged.
-- Longitudinal acceleration: first ``--warmup_frames`` rows match lead longitudinal
-  acceleration (and ``accel_sim`` for closed loop); thereafter **closed-loop** BC-GRU using
-  ``ego_v_roll`` / ``gap_roll`` Euler updates and ``build_closed_loop_feature_row`` identical
-  to training features (scalar TTC rule = ``distance / max(ego_speed−lead_speed, …)``, THW /
-  reciprocal columns match ``calibrate_following_data``).
-- Longitudinal integration writes ``ego_pos_x`` / ``ego_speed`` from **closed-loop** ``ego_v_roll``
-  (subtract trapezoid path); recomputes ``distance_headway`` / ``ttc`` / ``time_headway``.
-  BC longitudinal acceleration is **clipped** (default −8 … 6 m/s², same band as calibrated data)
-  before the roll-forward; ``--min_ego_speed_mps`` defaults small to reduce plateaus at zero speed
-  under repeated braking in low‑speed rollout. Disable with ``--min_ego_speed_mps 0``.
-- Lateral channels: ``original_jitter`` (wrap sample from driver pool) or
-  ``pooled_mean_smooth`` (merge residuals from ``--lateral_pool_drivers``, moving-average,
-  deterministic wrap). See ``--lateral_pool_drivers`` vs ``--lateral_pool_driver``.
-- Lead-vehicle behavior columns stay exactly as recorded in original data.
-
-Batch example: **T12 的「公共场景」指的是 T12 这段驾驶里记录的前车轨迹与世界状态**
-（``lead_*``、``distance_headway``、时间轴等），通过把 ``--data_dir`` 固定在 T12 会话目录，
-让所有被试在**完全相同的前车行为**下对比；**不是**指共用 T12 训练出来的 GRU 权重。
-每个 ``D`` 仍用 ``--model_dir`` 里对应 ``T${D}`` 的纵向模型；横向残差池默认也从
-``--data_dir`` 下 segment 构建，因此若目录里只有 T12，横向也会来自 T12。若要横向也个性化，
-可另设 ``--lateral_pool_data_dir`` / ``--lateral_pool_driver``。
+Same closed-loop pipeline as ``generate_no_driver_following_outputs.py`` (causal window, warm-up,
+integration, lateral jitter / pooled residual). Requires ``model_meta.json`` with ``tcn_channels``
+(from ``train_bc_tcn.py``); ``tcn_kernel_size`` defaults to 3 if omitted; ``arch`` should be ``tcn``.
 
 COMMON_CASE="/home/zwx/driver_model/following/outputs/following_calibrated/T12/行车/20260421_120610_198_exp1_f"
 
 for i in $(seq 1 20); do
   D="T${i}"
-  python3 /home/zwx/driver_model/following/gru_train/generate_no_driver_following_outputs.py \
+  python3 /home/zwx/driver_model/following/gru_train/generate_no_driver_following_outputs_tcn.py \
     --data_dir "${COMMON_CASE}" \
-    --model_dir "/home/zwx/driver_model/following/outputs/il_bc_gru_per_driver/${D}_longitudinal_framewin" \
-    --out_dir "/home/zwx/driver_model/following/outputs/personalized_no_driver_common_lead/${D}" \
+    --model_dir "/home/zwx/driver_model/following/outputs/il_bc_tcn_per_driver/${D}" \
+    --out_dir "/home/zwx/driver_model/following/outputs/personalized_no_driver_tcn_common_lead/${D}" \
     --lateral_mode original_jitter \
     --lane_center_y -7.625 \
     --seed 42
 done
-
-  python3 /home/zwx/driver_model/following/train/generate_no_driver_following_outputs.py \
-    --data_dir "/home/zwx/driver_model/data/T12/行车/20260421_120610_198_exp1_f" \
-    --model_dir "/home/zwx/driver_model/following/outputs/il_bc_gru_per_driver/T9_longitudinal_framewin" \
-    --out_dir "/home/zwx/driver_model/following/outputs/personalized_no_driver_common_lead/T9" \
-    --lateral_mode original_jitter \
-    --lane_center_y -7.625 \
-    --seed 42 
 """
 from __future__ import print_function
 
@@ -457,7 +430,7 @@ def _apply_tt_th_inv_to_row(row, dh_m, ego_speed_mag, lead_speed_mag):
 
 def build_closed_loop_feature_row(template_row, ego_v_f, accel_in_f, gap_f):
     """
-    Shallow-copy template lead columns; override ego/longitudinal-gap fields consumed by BC-GRU.
+    Shallow-copy template lead columns; override ego/longitudinal-gap fields consumed by BC policies.
 
     Closing kinematics align with ``calibrate_following_data`` (scalar ``ego − lead``
     closing rate; bounded gap / THW thresholds). Writes ``inv_ttc`` / ``inv_time_headway``
@@ -509,12 +482,12 @@ def main():
     ap.add_argument(
         "--model_dir",
         type=str,
-        default="/home/zwx/driver_model/outputs/il_bc_gru_gap04",
+        default="/home/zwx/driver_model/following/outputs/il_bc_tcn_per_driver/T9",
     )
     ap.add_argument(
         "--out_dir",
         type=str,
-        default="/home/zwx/driver_model/outputs/following_no_driver_bc",
+        default="/home/zwx/driver_model/following/outputs/following_no_driver_bc_tcn",
     )
     ap.add_argument("--lane_center_y", type=float, default=-7.625)
     ap.add_argument("--lane_width", type=float, default=3.75)
@@ -581,32 +554,76 @@ def main():
     args = ap.parse_args()
 
     import torch
+    import torch.nn.functional as F
     from torch import nn
 
-    class BCGRU(nn.Module):
-        def __init__(self, input_dim, hidden_dim, num_layers, dropout, output_dim):
-            super(BCGRU, self).__init__()
-            self.gru = nn.GRU(
-                input_size=input_dim,
-                hidden_size=hidden_dim,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=dropout if num_layers > 1 else 0.0,
-            )
-            self.head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, output_dim),
+    class CausalConv1d(nn.Module):
+        def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
+            super(CausalConv1d, self).__init__()
+            self._pad = (kernel_size - 1) * dilation
+            self.conv = nn.Conv1d(
+                in_channels, out_channels, kernel_size,
+                padding=0, dilation=dilation,
             )
 
         def forward(self, x):
-            out, _ = self.gru(x)
-            h = out[:, -1, :]
-            return self.head(h)
+            if self._pad > 0:
+                x = F.pad(x, (self._pad, 0))
+            return self.conv(x)
+
+    class TemporalBlock(nn.Module):
+        def __init__(self, in_ch, out_ch, kernel_size, dilation, dropout):
+            super(TemporalBlock, self).__init__()
+            self.conv1 = CausalConv1d(in_ch, out_ch, kernel_size, dilation)
+            self.relu1 = nn.ReLU()
+            self.drop1 = nn.Dropout(dropout)
+            self.conv2 = CausalConv1d(out_ch, out_ch, kernel_size, dilation)
+            self.relu2 = nn.ReLU()
+            self.drop2 = nn.Dropout(dropout)
+            self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
+            self.relu = nn.ReLU()
+
+        def forward(self, x):
+            out = self.drop1(self.relu1(self.conv1(x)))
+            out = self.drop2(self.relu2(self.conv2(out)))
+            res = x if self.downsample is None else self.downsample(x)
+            return self.relu(out + res)
+
+    class BCTCN(nn.Module):
+        """Must stay in sync with ``train_bc_tcn.BCTCN``."""
+
+        def __init__(self, input_dim, channel_dims, kernel_size, dropout, output_dim):
+            super(BCTCN, self).__init__()
+            if not channel_dims:
+                raise ValueError("channel_dims must be non-empty")
+            layers = []
+            for i, out_c in enumerate(channel_dims):
+                dilation = 2 ** i
+                in_c = input_dim if i == 0 else channel_dims[i - 1]
+                layers.append(TemporalBlock(in_c, out_c, kernel_size, dilation, dropout))
+            self.tcn = nn.Sequential(*layers)
+            self.head = nn.Linear(channel_dims[-1], output_dim)
+
+        def forward(self, x):
+            z = x.transpose(1, 2)
+            z = self.tcn(z)
+            last = z[:, :, -1]
+            return self.head(last)
 
     report_path = os.path.join(args.model_dir, "train_report.json")
     meta_path = os.path.join(args.model_dir, "model_meta.json")
     model_path = os.path.join(args.model_dir, "best_model.pt")
+    for label, p in (
+        ("train_report.json", report_path),
+        ("model_meta.json", meta_path),
+        ("best_model.pt", model_path),
+    ):
+        if not os.path.isfile(p):
+            raise SystemExit(
+                "Missing {!r}:\n  {}\n"
+                "This directory is not a complete train_bc_tcn.py output. "
+                "Train that driver (or fix the path), then rerun.".format(label, p)
+            )
     with open(report_path, "r", encoding="utf-8") as f:
         report = json.load(f)
     with open(meta_path, "r", encoding="utf-8") as f:
@@ -633,11 +650,41 @@ def main():
     else:
         device = torch.device(args.device)
 
-    model = BCGRU(
+    arch = str(meta.get("arch", "")).strip().lower()
+    if arch and arch != "tcn":
+        print(
+            "[WARN] model_meta.json arch={!r} is not 'tcn'; this script expects a TCN checkpoint.".format(
+                meta.get("arch")
+            ),
+            file=sys.stderr,
+        )
+    if "tcn_channels" not in meta:
+        raise SystemExit(
+            "model_meta.json missing 'tcn_channels' (need train_bc_tcn.py export). Got keys: {}".format(
+                sorted(meta.keys())
+            )
+        )
+    ch_meta = meta["tcn_channels"]
+    if isinstance(ch_meta, list):
+        channel_dims = [int(x) for x in ch_meta]
+    else:
+        channel_dims = [
+            int(x.strip()) for x in str(ch_meta).split(",") if str(x).strip()
+        ]
+    if not channel_dims:
+        raise SystemExit(
+            "model_meta.json 'tcn_channels' parsed to an empty list (check value: {!r}).".format(
+                ch_meta
+            )
+        )
+    tcn_kernel_size = int(meta.get("tcn_kernel_size", 3))
+    dropout_inf = float(meta.get("dropout", 0.1))
+
+    model = BCTCN(
         input_dim=len(features),
-        hidden_dim=int(meta["hidden_dim"]),
-        num_layers=int(meta["num_layers"]),
-        dropout=0.1,
+        channel_dims=channel_dims,
+        kernel_size=tcn_kernel_size,
+        dropout=dropout_inf,
         output_dim=len(targets),
     ).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
@@ -758,7 +805,7 @@ def main():
         for t in range(first_model_i, n):
             feats_win = []
             ok_w = True
-            # Causal window: rows [t-seq_len, t-1] only (matches train_bc_gru._build_samples).
+            # Causal window: rows [t-seq_len, t-1] only (matches train_bc_gru / train_bc_tcn sampling).
             for j in range(t - seq_len, t):
                 if j < first_model_i:
                     row_eff = rows[j]
@@ -961,6 +1008,7 @@ def main():
                 "n_rows": str(len(rows)),
                 "n_pred_rows": str(n_pred),
                 "driver_id": _extract_driver_id(fp),
+                "policy_arch": "tcn",
                 "lateral_mode": args.lateral_mode,
                 "lateral_pool_driver": lat_drv,
                 "lateral_pool_drivers": lateral_pool_drivers_disp,
@@ -978,6 +1026,7 @@ def main():
                 "n_rows",
                 "n_pred_rows",
                 "driver_id",
+                "policy_arch",
                 "lateral_mode",
                 "lateral_pool_driver",
                 "lateral_pool_drivers",

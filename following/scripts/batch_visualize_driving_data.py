@@ -1,17 +1,25 @@
+#!/usr/bin/env python3
 """
 Recursively find driving_data CSV files under a root directory and generate the same
 four-panel plots as visualize_data.py.
 
 Uses a non-interactive matplotlib backend so no windows open during batch runs.
-Default output layout mirrors the directory structure under ROOT inside
-following/outputs/pictures (avoids flat-name collisions).
-"""
+PNG files are written under ``<out-dir>/<ROOT_BASENAME>/...`` where ROOT_BASENAME is
+the last path component of ROOT (e.g. ``outputs`` when ROOT is ``.../following/outputs``),
+then mirroring paths inside ROOT unless ``--flat-names`` is set.
 
-from __future__ import annotations
+Run with Python 3, for example::
+
+    python3 following/scripts/batch_visualize_driving_data.py [ROOT]
+    
+    python3 /home/zwx/driver_model/following/scripts/batch_visualize_driving_data.py /home/zwx/driver_model/following/outputs/personalized_no_driver_common_lead
+
+"""
 
 import argparse
 import sys
 from pathlib import Path
+from typing import List
 
 import matplotlib
 
@@ -27,7 +35,7 @@ from visualize_data import visualize_driving_csv  # noqa: E402
 DRIVING_DATA_NAME = 'driving_data.csv'
 
 
-def find_driving_data_csv_files(root: Path) -> list[Path]:
+def find_driving_data_csv_files(root: Path) -> List[Path]:
     root = root.resolve()
     if not root.is_dir():
         return []
@@ -53,7 +61,8 @@ def main() -> int:
         '--out-dir',
         type=str,
         default=None,
-        help='PNG output directory (default: following/outputs/pictures)',
+        help='PNG parent directory (default: following/outputs/pictures); PNGs go under '
+        '<OUT_DIR>/<ROOT_LAST_NAME>/',
     )
     parser.set_defaults(smooth=True)
     sm_group = parser.add_mutually_exclusive_group()
@@ -67,11 +76,13 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path(args.root).expanduser().resolve()
-    pictures_dir = (
+    pictures_base = (
         Path(args.out_dir).expanduser().resolve()
         if args.out_dir
         else following_dir / 'outputs' / 'pictures'
     )
+    root_tag = root.name or 'batch'
+    pictures_dir = pictures_base / root_tag
 
     csv_files = find_driving_data_csv_files(root)
     if not csv_files:

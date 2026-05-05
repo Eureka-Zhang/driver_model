@@ -17,8 +17,10 @@ Input data layout:
   or segment_XXX.csv (e.g. imitation-clean segments)
 
 Default target:
-  predict longitudinal acceleration at t:
-    [ego_a_long]
+  predict longitudinal acceleration at ``t`` using **only** past features
+  ``[t-seq_len, t-1]`` (strictly causal window; no same-timestep leakage).
+
+Optional ``--jerk_penalty_weight`` adds smoothing vs. last observed ``ego_a_long`` in physical units.
 
 for i in $(seq 1 20); do
   D="T${i}"
@@ -56,7 +58,6 @@ from __future__ import print_function
 import argparse
 import csv
 import json
-import math
 import os
 import random
 import re
@@ -173,10 +174,10 @@ def _build_samples(segment_paths, features, targets, seq_len, time_column, time_
         if arr_x is None:
             continue
         n = arr_x.shape[0]
-        if n < seq_len:
+        if n <= seq_len:
             continue
-        for t in range(seq_len - 1, n):
-            xs.append(arr_x[t - seq_len + 1 : t + 1])
+        for t in range(seq_len, n):
+            xs.append(arr_x[t - seq_len : t])
             ys.append(arr_y[t])
             meta.append(p)
     if not xs:
@@ -275,20 +276,51 @@ def _weighted_mse(pred, target, weights):
     return torch.mean(diff2 * weights)
 
 
-def _run_epoch(model, loader, optimizer, device, action_weights):
+def _run_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    action_weights,
+    ego_a_feature_idx,
+    feat_mean_accel,
+    feat_std_accel,
+    jerk_penalty_weight,
+    grad_clip_norm,
+    ego_a_target_idx,
+):
+    """
+    MSE on targets plus optional jerk penalty: squared gap between predicted accel and **physical**
+    last-frame ``ego_a_long`` (denormalized from standardized inputs).
+    """
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
     total_n = 0
+    mean_a = torch.tensor(float(feat_mean_accel), device=device, dtype=torch.float32)
+    std_a = torch.tensor(float(feat_std_accel), device=device, dtype=torch.float32)
+
     for xb, yb in loader:
         xb = xb.to(device)
         yb = yb.to(device)
         if training:
             optimizer.zero_grad()
+
         pred = model(xb)
-        loss = _weighted_mse(pred, yb, action_weights)
+        loss_mse = _weighted_mse(pred, yb, action_weights)
+
+        if jerk_penalty_weight and jerk_penalty_weight > 0.0:
+            prev_a_phys = xb[:, -1, ego_a_feature_idx] * std_a + mean_a
+            pred_a = pred[:, ego_a_target_idx : ego_a_target_idx + 1]
+            loss_jerk = torch.mean((pred_a - prev_a_phys.unsqueeze(1)) ** 2)
+            loss = loss_mse + jerk_penalty_weight * loss_jerk
+        else:
+            loss = loss_mse
+
         if training:
             loss.backward()
+            if grad_clip_norm and grad_clip_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
         b = xb.shape[0]
         total_loss += loss.item() * b
@@ -374,6 +406,21 @@ def main():
     ap.add_argument("--val_ratio", type=float, default=0.15)
     ap.add_argument("--test_ratio", type=float, default=0.15)
     ap.add_argument("--max_segments", type=int, default=0)
+    ap.add_argument(
+        "--jerk_penalty_weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Weight on squared (pred_accel - last_observed_ego_a_long) jerk penalty in physical units; "
+            "0 disables. Increase if outputs are jittery, decrease if sluggish."
+        ),
+    )
+    ap.add_argument(
+        "--grad_clip_norm",
+        type=float,
+        default=1.0,
+        help="Max gradient norm for clip_grad_norm_; 0 disables clipping.",
+    )
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -441,6 +488,14 @@ def main():
 
     features = list(DEFAULT_FEATURES_LEGACY if args.with_dt_prev else DEFAULT_FEATURES)
     targets = list(DEFAULT_TARGETS)
+    try:
+        ego_a_feature_idx = features.index("ego_a_long")
+    except ValueError:
+        raise RuntimeError("features must include 'ego_a_long' (needed for jerk penalty inputs).")
+    try:
+        ego_a_target_idx = targets.index("ego_a_long")
+    except ValueError:
+        raise RuntimeError("targets must include 'ego_a_long' for this BC script.")
     target_weights = [float(x.strip()) for x in args.target_weights.split(",") if x.strip()]
     if len(target_weights) != len(targets):
         raise RuntimeError(
@@ -520,8 +575,32 @@ def main():
 
     history = []
     for ep in range(1, args.epochs + 1):
-        train_loss = _run_epoch(model, train_loader, optimizer, device, action_weights)
-        val_loss = _run_epoch(model, val_loader, None, device, action_weights)
+        train_loss = _run_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            action_weights,
+            ego_a_feature_idx,
+            float(feat_mean[ego_a_feature_idx]),
+            float(feat_std[ego_a_feature_idx]),
+            args.jerk_penalty_weight,
+            args.grad_clip_norm,
+            ego_a_target_idx,
+        )
+        val_loss = _run_epoch(
+            model,
+            val_loader,
+            None,
+            device,
+            action_weights,
+            ego_a_feature_idx,
+            float(feat_mean[ego_a_feature_idx]),
+            float(feat_std[ego_a_feature_idx]),
+            args.jerk_penalty_weight,
+            args.grad_clip_norm,
+            ego_a_target_idx,
+        )
         history.append({"epoch": ep, "train_loss": train_loss, "val_loss": val_loss})
         print(
             "epoch {:03d} train_loss {:.6f} val_loss {:.6f}".format(
@@ -572,6 +651,11 @@ def main():
         "n_val_segments": len(val_paths),
         "n_test_segments": len(test_paths),
         "target_weights": target_weights,
+        "jerk_penalty_weight": args.jerk_penalty_weight,
+        "grad_clip_norm": args.grad_clip_norm,
+        "causal_window": True,
+        "ego_a_feature_idx": ego_a_feature_idx,
+        "ego_a_target_idx": ego_a_target_idx,
     }
     with open(os.path.join(args.out_dir, "train_report.json"), "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -584,6 +668,9 @@ def main():
                 "hidden_dim": args.hidden_dim,
                 "num_layers": args.num_layers,
                 "target_weights": target_weights,
+                "jerk_penalty_weight": args.jerk_penalty_weight,
+                "grad_clip_norm": args.grad_clip_norm,
+                "causal_window": True,
             },
             f,
             ensure_ascii=False,

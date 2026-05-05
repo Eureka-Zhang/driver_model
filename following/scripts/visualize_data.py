@@ -1,13 +1,16 @@
 import argparse
 from pathlib import Path
+from typing import Optional, Union
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-'''
-python /home/zwx/driver_model/following/scripts/visualize_data.py /home/zwx/driver_model/following/outputs/following_calibrated/T12/行车/20260421_120610_198_exp1_f/driving_data.csv --no-smooth
-'''
+# Single file:
+#   python .../visualize_data.py path/to/driving_data.csv
+# Whole tree (same layout as outputs from generate_* under a driver/session root):
+#   python .../visualize_data.py path/to/personalized_no_driver_tcn_common_lead --no-smooth
+# Saves PNGs under outputs/pictures/<DIR_BASENAME>/... mirroring paths inside DIR.
 
 try:
     from scipy.signal import savgol_filter as _savgol_filter
@@ -17,6 +20,14 @@ except ImportError:  # optional dependency
 
 def default_pictures_dir() -> Path:
     return Path(__file__).resolve().parent.parent / 'outputs' / 'pictures'
+
+
+def _discover_driving_data_csvs(root: Path):
+    """Sorted paths to every driving_data.csv under root (recursive)."""
+    root = root.resolve()
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.rglob('driving_data.csv') if p.is_file())
 
 
 def smooth_1d(y, frac_window=0.04):
@@ -56,7 +67,7 @@ def _resolve_output_png(
     pictures_dir: Path,
     *,
     flat_output: bool,
-    path_relative_root: Path | None,
+    path_relative_root: Optional[Path],
 ) -> Path:
     csv_res = csv_path.resolve()
     if flat_output:
@@ -72,15 +83,15 @@ def _resolve_output_png(
 
 
 def visualize_driving_csv(
-    csv_path: str | Path,
+    csv_path: Union[str, Path],
     *,
     smooth: bool = True,
     save: bool = True,
     show: bool = True,
-    pictures_dir: Path | None = None,
+    pictures_dir: Optional[Path] = None,
     flat_output: bool = True,
-    path_relative_root: Path | None = None,
-) -> Path | None:
+    path_relative_root: Optional[Path] = None,
+) -> Optional[Path]:
     """
     Plot one driving_data CSV (position / speed / acceleration / headway) and optionally save/show.
 
@@ -137,7 +148,7 @@ def visualize_driving_csv(
 
     plt.tight_layout()
 
-    out_path: Path | None = None
+    out_path: Optional[Path] = None
     if save:
         dest = pictures_dir if pictures_dir is not None else default_pictures_dir()
         out_path = _resolve_output_png(
@@ -158,12 +169,13 @@ def visualize_driving_csv(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Plot driving_data.csv time series (position, speed, accel, headway).'
+        description='Plot driving_data.csv time series (position, speed, accel, headway). '
+        'Pass a CSV file, or a directory (every driving_data.csv under it is saved, no GUI).'
     )
     parser.add_argument(
         'csv',
-        metavar='CSV',
-        help='Path to the CSV file to plot (e.g. driving_data.csv).',
+        metavar='CSV_OR_DIR',
+        help='Path to driving_data.csv, or a directory to search recursively.',
     )
     parser.set_defaults(smooth=True)
     sm_group = parser.add_mutually_exclusive_group()
@@ -180,9 +192,37 @@ def main() -> None:
         help='Plot raw CSV columns without filtering.',
     )
     args = parser.parse_args()
+    path = Path(args.csv).expanduser().resolve()
+
+    if not path.exists():
+        raise SystemExit('Path does not exist: {!r}'.format(str(path)))
+
+    if path.is_dir():
+        csvs = _discover_driving_data_csvs(path)
+        if not csvs:
+            raise SystemExit(
+                'No driving_data.csv under {!r}. Pass a CSV file or a directory '
+                'that contains driving_data.csv (e.g. a session folder).'.format(str(path))
+            )
+        pictures_dir = default_pictures_dir() / (path.name or 'batch')
+        for csv_path in csvs:
+            visualize_driving_csv(
+                csv_path,
+                smooth=args.smooth,
+                save=True,
+                show=False,
+                pictures_dir=pictures_dir,
+                flat_output=False,
+                path_relative_root=path,
+            )
+        print('Saved {} figure(s) under {}'.format(len(csvs), pictures_dir))
+        return
+
+    if not path.is_file():
+        raise SystemExit('Not a file or directory: {!r}'.format(str(path)))
 
     visualize_driving_csv(
-        args.csv,
+        str(path),
         smooth=args.smooth,
         save=True,
         show=True,
