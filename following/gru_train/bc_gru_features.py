@@ -4,9 +4,11 @@ Single source for BC-GRU row parsing / feature extraction (trained in train_bc_g
 
 All generators must import here — do not duplicate _row_value semantics.
 
-Feature order (longitudinal IL):
-  dt_prev, ego_v_long, ego_a_long, distance_headway, relative_v_long, lead_v_long,
+Default feature order (longitudinal IL, uniform sim step — no ``dt_prev``):
+  ego_v_long, ego_a_long, distance_headway, relative_v_long, lead_v_long,
   inv_ttc, inv_time_headway
+
+Legacy (variable wall-clock ``timestamp`` spacing) adds ``dt_prev`` first — see ``DEFAULT_FEATURES_LEGACY``.
 
 ``inv_ttc`` / ``inv_time_headway`` match ``calibrate_following_data`` /
 ``clean_following_for_imitation`` (1/x with 0 when x≈999 or invalid). No ``*_valid`` flags.
@@ -16,7 +18,19 @@ import math
 
 DEFAULT_TARGETS = ["ego_a_long"]
 
+# Uniform simulation timeline (e.g. ``sim_time_s`` / fixed 0.05 s per row): no Δt in inputs.
 DEFAULT_FEATURES = [
+    "ego_v_long",
+    "ego_a_long",
+    "distance_headway",
+    "relative_v_long",
+    "lead_v_long",
+    "inv_ttc",
+    "inv_time_headway",
+]
+
+# Original BC-GRU layout when rows use wall-clock ``timestamp``.
+DEFAULT_FEATURES_LEGACY = [
     "dt_prev",
     "ego_v_long",
     "ego_a_long",
@@ -194,13 +208,17 @@ def features_at_timestep(rows, timestamps, idx, features):
 
     Returns list of floats, or ``None`` if any required scalar is missing/invalid.
 
+    If ``features`` omits ``dt_prev`` (uniform sim grid), timestamps are unused for features.
+
     Args:
         rows: list of row dicts (from CSV).
-        timestamps: list of floats/None aligned with rows (typically precomputed).
+        timestamps: list of floats/None aligned with rows (for ``dt_prev`` only).
         idx: row index ``0 .. len(rows)-1``.
         features: ordered feature names, same list as training.
     """
     r = rows[idx]
+    if "dt_prev" not in features:
+        return scalar_features_for_row(r, 0.0, features)
     if idx == 0:
         dtv = 0.0
     else:

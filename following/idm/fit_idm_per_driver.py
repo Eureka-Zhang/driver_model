@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Fit a classic Intelligent Driver Model (Treiber-Hennecke-Helbing) per subject from
-following ``segment_*.csv``.
+following trajectories: ``**/segment_<n>.csv`` (imitation-clean) or ``**/driving_data.csv``
+(calibrated sessions). Rows are sorted by ``sim_time_s`` when present (--time-column),
+else ``timestamp``, before pooling samples.
 
 Uses the textbook acceleration law (same unit convention as calibrated IL CSV):
 
@@ -23,7 +25,7 @@ Output (per driver + summary):
 Batch example::
 
   python3 /home/zwx/driver_model/following/idm/fit_idm_per_driver.py \
-    --data_dir /home/zwx/driver_model/following/outputs/following_il_clean_gap04 \
+    --data_dir /home/zwx/driver_model/following/outputs/following_calibrated \
     --out_dir /home/zwx/driver_model/following/outputs/idm_per_driver \
     --n_restarts 5 --epochs 3000
 
@@ -192,16 +194,29 @@ def hydrate_following_row(row):
     return r
 
 
-def _discover_segment_csvs(data_dir):
+def _discover_following_csvs(data_dir):
+    """Collect ``segment_<n>.csv`` (IL-clean) or ``driving_data.csv`` (calibrated exports)."""
     out = []
     for root, _, files in os.walk(data_dir):
         for fn in files:
             if not fn.endswith(".csv"):
                 continue
-            if not re.match(r"segment_\d+\.csv$", fn):
-                continue
-            out.append(os.path.join(root, fn))
+            if fn == "driving_data.csv" or re.match(r"segment_\d+\.csv$", fn):
+                out.append(os.path.join(root, fn))
     return sorted(out)
+
+
+def _sort_rows_by_time(rows, primary, fallback):
+    """Chronological order for reproducibility; IDM residual is instantaneous but avoids shuffled CSVs."""
+    ts = [_parse_float(r.get(primary)) for r in rows]
+    if ts and all(t is not None for t in ts):
+        order = sorted(range(len(rows)), key=lambda i: ts[i])
+        return [rows[i] for i in order]
+    ts2 = [_parse_float(r.get(fallback)) for r in rows]
+    if ts2 and all(t is not None for t in ts2):
+        order = sorted(range(len(rows)), key=lambda i: ts2[i])
+        return [rows[i] for i in order]
+    return rows
 
 
 def _extract_driver_id(path):
@@ -306,7 +321,15 @@ def _fit_single_restart(
     return rmse, loss_best, params
 
 
-def extract_samples_from_segments(paths, gap_min, gap_max, vmin, vmax_gap_outlier_speed):
+def extract_samples_from_segments(
+    paths,
+    gap_min,
+    gap_max,
+    vmin,
+    vmax_gap_outlier_speed,
+    time_column="sim_time_s",
+    time_fallback_column="timestamp",
+):
     v_list = []
     vl_list = []
     g_list = []
@@ -322,6 +345,7 @@ def extract_samples_from_segments(paths, gap_min, gap_max, vmin, vmax_gap_outlie
         if not rows:
             continue
         rows = [hydrate_following_row(dict(r)) for r in rows]
+        rows = _sort_rows_by_time(rows, time_column, time_fallback_column)
         for r in rows:
             ev = _row_value_csv(r, "ego_v_long")
             if ev is None:
@@ -368,7 +392,19 @@ def main():
     ap.add_argument(
         "--data_dir",
         type=str,
-        default="/home/zwx/driver_model/following/outputs/following_il_clean_gap04",
+        default="/home/zwx/driver_model/following/outputs/following_calibrated",
+    )
+    ap.add_argument(
+        "--time_column",
+        type=str,
+        default="sim_time_s",
+        help="Sort rows within each CSV by this column when all values parse (sim grid).",
+    )
+    ap.add_argument(
+        "--time_fallback_column",
+        type=str,
+        default="timestamp",
+        help="Fallback time column for sorting when --time_column has missing entries.",
     )
     ap.add_argument(
         "--out_dir",
@@ -414,10 +450,10 @@ def main():
     else:
         device = torch.device(device_str)
 
-    segs = _discover_segment_csvs(args.data_dir)
+    segs = _discover_following_csvs(args.data_dir)
     if not segs:
         print(
-            "No segment_*.csv under {}; check --data_dir.".format(args.data_dir),
+            "No driving_data.csv or segment_*.csv under {}; check --data_dir.".format(args.data_dir),
             file=sys.stderr,
         )
         return 2
@@ -459,7 +495,13 @@ def main():
     for d in drivers:
         paths = by_driver.get(d, [])
         pack = extract_samples_from_segments(
-            paths, args.gap_min, args.gap_max, args.min_speed, args.max_speed_keep
+            paths,
+            args.gap_min,
+            args.gap_max,
+            args.min_speed,
+            args.max_speed_keep,
+            time_column=args.time_column,
+            time_fallback_column=args.time_fallback_column,
         )
         if pack is None or len(pack[0]) < 50:
             print(

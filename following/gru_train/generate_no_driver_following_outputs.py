@@ -25,11 +25,11 @@ Batch example: **T12 的「公共场景」指的是 T12 这段驾驶里记录的
 ``--data_dir`` 下 segment 构建，因此若目录里只有 T12，横向也会来自 T12。若要横向也个性化，
 可另设 ``--lateral_pool_data_dir`` / ``--lateral_pool_driver``。
 
-COMMON_CASE="/home/zwx/driver_model/following/outputs/following_il_clean_gap04/T12/行车/20260421_120610_198_exp1_f"
+COMMON_CASE="/home/zwx/driver_model/following/outputs/following_calibrated/T12/行车/20260421_120610_198_exp1_f"
 
 for i in $(seq 1 20); do
   D="T${i}"
-  python3 /home/zwx/driver_model/following/train/generate_no_driver_following_outputs.py \
+  python3 /home/zwx/driver_model/following/gru_train/generate_no_driver_following_outputs.py \
     --data_dir "${COMMON_CASE}" \
     --model_dir "/home/zwx/driver_model/following/outputs/il_bc_gru_per_driver/${D}_longitudinal_framewin" \
     --out_dir "/home/zwx/driver_model/following/outputs/personalized_no_driver_common_lead/${D}" \
@@ -65,12 +65,21 @@ if _SCRIPT_DIR not in sys.path:
 
 from bc_gru_features import (
     DEFAULT_FEATURES,
+    DEFAULT_FEATURES_LEGACY,
     _parse_float,
     _row_value,
     hydrate_bc_gru_row_aliases,
     reciprocal_inv_feature,
     scalar_features_for_row,
 )
+
+
+def _integration_timestamps(rows):
+    """Prefer ``sim_time_s`` (uniform CARLA step); else ``timestamp``."""
+    sts = [_parse_float(r.get("sim_time_s")) for r in rows]
+    if sts and all(x is not None for x in sts):
+        return sts
+    return [_parse_float(r.get("timestamp")) for r in rows]
 
 
 def _scenario_tree_path_allowed(p_sub):
@@ -299,7 +308,7 @@ def _finalize_longitudinal_from_roll(rows, ego_v_roll, distance_offset, vmin_mps
             "ego_v_roll length {} != rows {}".format(len(ego_v_roll), len(rows))
         )
     n = len(rows)
-    ts = [_parse_float(r.get("timestamp")) for r in rows]
+    ts = _integration_timestamps(rows)
     acc = [_original_ego_long_accel(r) for r in rows]
     x0 = _parse_float(rows[0].get("ego_pos_x"))
     if x0 is None:
@@ -606,10 +615,14 @@ def main():
     features = list(meta["features"])
     targets = list(meta["targets"])
     seq_len = int(meta["seq_len"])
-    if list(features) != list(DEFAULT_FEATURES):
+    if list(features) not in (
+        list(DEFAULT_FEATURES),
+        list(DEFAULT_FEATURES_LEGACY),
+    ):
         print(
-            "[WARN] model_meta.json feature list differs from bc_gru_features.DEFAULT_FEATURES "
-            "(order or names mismatch — closed loop may diverge from training)."
+            "[WARN] model_meta.json feature list differs from bc_gru_features "
+            "DEFAULT_FEATURES / DEFAULT_FEATURES_LEGACY (order or names mismatch — "
+            "closed loop may diverge from training)."
         )
     feat_mean = np.asarray(report["feature_mean"], dtype=np.float32)
     feat_std = np.asarray(report["feature_std"], dtype=np.float32)
@@ -698,7 +711,7 @@ def main():
 
         orig_long_acc = [_original_ego_long_accel(r) for r in rows]
 
-        ts = [_parse_float(r.get("timestamp")) for r in rows]
+        ts = _integration_timestamps(rows)
         n = len(rows)
         accel_sim = [0.0] * n
         ego_v_roll = [0.0] * n
@@ -757,14 +770,17 @@ def main():
                         ok_w = False
                         break
                     row_eff = sr
-                if j == 0:
-                    dt_prev = 0.0
+                if "dt_prev" in features:
+                    if j == 0:
+                        dt_prev = 0.0
+                    else:
+                        t0, t1 = ts[j - 1], ts[j]
+                        if t0 is None or t1 is None:
+                            ok_w = False
+                            break
+                        dt_prev = max(0.0, t1 - t0)
                 else:
-                    t0, t1 = ts[j - 1], ts[j]
-                    if t0 is None or t1 is None:
-                        ok_w = False
-                        break
-                    dt_prev = max(0.0, t1 - t0)
+                    dt_prev = 0.0
                 fv = scalar_features_for_row(row_eff, dt_prev, features)
                 if fv is None:
                     ok_w = False

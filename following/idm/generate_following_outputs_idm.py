@@ -9,7 +9,8 @@ or ``bc_gru_features`` (logic is inlined so IDM generation does not depend on GR
 - **Longitudinal after warmup**: Treiber IDM from ``<idm_dir>/<follower_driver>/idm.json``.
 - **Warmup**: first ``--warmup_frames`` rows use lead longitudinal acceleration; ``ego_v_roll`` advanced
   consistently before IDM steps.
-- **Lateral**: ``original_jitter`` / ``pooled_mean_smooth`` / else keep original columns.
+Closed-loop integration uses **`sim_time_s` when every row has it** (uniform sim step, e.g.
+calibrated exports); otherwise falls back to **`timestamp`** (wall clock).
 
 Example::
 
@@ -85,6 +86,14 @@ def _parse_float(v):
         return float(s)
     except ValueError:
         return None
+
+
+def _integration_timestamps(rows):
+    """Prefer ``sim_time_s`` (CARLA fixed step); else ``timestamp``."""
+    sts = [_parse_float(r.get("sim_time_s")) for r in rows]
+    if sts and all(x is not None for x in sts):
+        return sts
+    return [_parse_float(r.get("timestamp")) for r in rows]
 
 
 def _row_value(row, key):
@@ -415,7 +424,7 @@ def _finalize_longitudinal_from_roll(rows, ego_v_roll, distance_offset, vmin_mps
             "ego_v_roll length {} != rows {}".format(len(ego_v_roll), len(rows))
         )
     n = len(rows)
-    ts = [_parse_float(r.get("timestamp")) for r in rows]
+    ts = _integration_timestamps(rows)
     acc = [_original_ego_long_accel(r) for r in rows]
     x0 = _parse_float(rows[0].get("ego_pos_x"))
     if x0 is None:
@@ -726,7 +735,7 @@ def main():
             if _ek not in fieldnames:
                 fieldnames.append(_ek)
 
-        ts = [_parse_float(r.get("timestamp")) for r in rows]
+        ts = _integration_timestamps(rows)
         n = len(rows)
 
         ex0 = _parse_float(rows[0].get("ego_pos_x"))
@@ -814,7 +823,7 @@ def main():
             if t + 1 < n:
                 if ts[t + 1] is None or ts[t] is None:
                     raise RuntimeError(
-                        "{} timestamps missing during IDM rollout at {}".format(rel_path, t)
+                        "{}: missing time axis (sim_time_s/timestamp) during IDM rollout at step {}".format(rel_path, t)
                     )
                 dt_fwd = max(0.0, ts[t + 1] - ts[t])
                 lv_fwd = lv_use

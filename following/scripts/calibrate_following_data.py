@@ -39,8 +39,12 @@ Calibrate following (跟驰) driving_data.csv trajectories.
   value is finite ``> 0`` and not the ``999`` sentinel; otherwise **0** (same rule as
   ``clean_following_for_imitation.py``).
 
+Adds ``sim_time_s``: simulation elapsed time (seconds), ``row_index * sim_dt_s`` (default 0.05 s
+per row, matching ``replay/experiment.py`` sync ``fixed_delta_seconds``). Kinematic differencing
+(vel/accel/jerk/yaw_rate) uses this uniform timeline instead of the wall-clock ``timestamp`` column.
+
 Does not modify: lead position/speed columns aside from derived long/lat here, throttle, brake,
-longitudinal_control, control_mode, gear, lead_behavior_mode, real_world_* , frame.
+longitudinal_control, control_mode, gear, lead_behavior_mode, real_world_* , frame, original ``timestamp``.
 
 python3 /home/zwx/driver_model/following/scripts/calibrate_following_data.py \
   --data_dir /home/zwx/driver_model/data \
@@ -404,22 +408,29 @@ def calibrate_rows(
     steer_mode,
     steer_smooth_window,
     road_heading_deg,
+    sim_dt_s,
 ):
     """
     rows_dicts: list of dicts with CSV columns.
     Returns new list of dicts (copies).
+
+    ``sim_dt_s``: fixed simulation seconds per row; time axis for derivatives is
+    ``ts[i] = i * sim_dt_s`` (wall-clock ``timestamp`` is not used for differencing).
     """
     n = len(rows_dicts)
     if n == 0:
         return []
 
-    ts = []
+    if sim_dt_s is None or not math.isfinite(float(sim_dt_s)) or float(sim_dt_s) <= 0:
+        sim_dt_s = 0.05
+    sim_dt_s = float(sim_dt_s)
+
+    ts = [i * sim_dt_s for i in range(n)]
     xs = []
     ys_raw = []
     lead_xs = []
     lead_ys = []
     for r in rows_dicts:
-        ts.append(_parse_float(r.get("timestamp"), 0.0))
         xs.append(_parse_float(r.get("ego_pos_x"), 0.0))
         ys_raw.append(_parse_float(r.get("ego_pos_y"), 0.0))
         lead_xs.append(_parse_float(r.get("lead_pos_x"), 0.0))
@@ -545,6 +556,7 @@ def calibrate_rows(
     out = []
     for i, r in enumerate(rows_dicts):
         new_r = dict(r)
+        new_r["sim_time_s"] = "{:.6f}".format(ts[i])
         new_r["ego_pos_y"] = "{:.6f}".format(ys[i])
         new_r["ego_v_long"] = "{:.6f}".format(abs(ego_v_long[i]))
         new_r["ego_v_lat"] = "{:.6f}".format(abs(ego_v_lat[i]))
@@ -682,6 +694,17 @@ def main():
         help="Centered moving average window when --steer_mode bicycle",
     )
     ap.add_argument("--max_files", type=int, default=0)
+    ap.add_argument(
+        "--sim-dt-s",
+        type=float,
+        default=0.05,
+        metavar="SEC",
+        help=(
+            "Seconds of simulation time per CSV row (CARLA sync fixed_delta_seconds). "
+            "Builds sim_time_s = row_index * sim_dt_s and uses this uniform axis for all "
+            "kinematic derivatives (replacing wall-clock timestamp differencing)."
+        ),
+    )
     args = ap.parse_args()
 
     if not (0.0 < args.lateral_scale <= 2.0):
@@ -702,6 +725,7 @@ def main():
         if not fieldnames:
             continue
         extra_fields = [
+            "sim_time_s",
             "ego_v_long",
             "ego_v_lat",
             "ego_a_long",
@@ -719,6 +743,11 @@ def main():
         for name in extra_fields:
             if name not in fieldnames:
                 fieldnames.append(name)
+        # Place sim_time_s immediately after timestamp when present (readability).
+        if "sim_time_s" in fieldnames and "timestamp" in fieldnames:
+            fieldnames = [f for f in fieldnames if f != "sim_time_s"]
+            ti = fieldnames.index("timestamp") + 1
+            fieldnames.insert(ti, "sim_time_s")
         calibrated = calibrate_rows(
             rows,
             y_center=args.y_center,
@@ -735,6 +764,7 @@ def main():
             steer_mode=args.steer_mode,
             steer_smooth_window=args.steer_smooth_window,
             road_heading_deg=args.road_heading_deg,
+            sim_dt_s=args.sim_dt_s,
         )
         # Ensure schema includes every key on output rows; drop stale ``*_valid`` from input lists.
         _no_valid = tuple(f for f in fieldnames if f not in ("ttc_valid", "time_headway_valid"))

@@ -4,19 +4,17 @@ Train a GRU behavior-cloning policy for car-following imitation learning.
 
 Feature parsing lives in ``bc_gru_features.py`` (same module used by rollout generators).
 
-Input feature vector per timestep (order matches ``DEFAULT_FEATURES``):
+Default input per timestep (matches ``bc_gru_features.DEFAULT_FEATURES``, **no** ``dt_prev``):
 
-  - ``dt_prev``: current ``timestamp`` − previous (0 on first row)
-  - ``ego_v_long``: from CSV or alias ``ego_speed``
-  - ``ego_a_long``
-  - ``distance_headway``
-  - ``relative_v_long`` (alias ``relative_speed``, or ``lead − ego`` long speeds)
-  - ``lead_v_long``
-  - ``inv_ttc``: reciprocal of ``ttc``, **0** when ``ttc≈999`` or invalid (``ttc_inverse`` alias)
-  - ``inv_time_headway``: reciprocal of ``time_headway``, **0** when sentinel/invalid
+  - ``ego_v_long``, ``ego_a_long``, ``distance_headway``, ``relative_v_long``,
+    ``lead_v_long``, ``inv_ttc``, ``inv_time_headway``
+
+Rows are sorted by ``sim_time_s`` (uniform sim grid from ``calibrate_following_data.py``).
+Use ``--with-dt-prev`` to restore the legacy 8-D input with wall-clock ``timestamp`` Δt.
 
 Input data layout:
-  <data_dir>/T*/行车/<session>/segment_XXX.csv
+  <data_dir>/T*/行车/<session>/driving_data.csv  (calibrated exports)
+  or segment_XXX.csv (e.g. imitation-clean segments)
 
 Default target:
   predict longitudinal acceleration at t:
@@ -24,8 +22,8 @@ Default target:
 
 for i in $(seq 1 20); do
   D="T${i}"
-  python /home/zwx/driver_model/following/train/train_bc_gru.py \
-    --data_dir /home/zwx/driver_model/following/outputs/following_il_clean_gap04 \
+  python /home/zwx/driver_model/following/gru_train/train_bc_gru.py \
+    --data_dir /home/zwx/driver_model/following/outputs/following_calibrated \
     --out_dir /home/zwx/driver_model/following/outputs/il_bc_gru_per_driver/${D}_longitudinal_framewin \
     --train_drivers ${D} \
     --val_drivers ${D} \
@@ -75,6 +73,7 @@ if _SCRIPT_DIR not in sys.path:
 
 from bc_gru_features import (
     DEFAULT_FEATURES,
+    DEFAULT_FEATURES_LEGACY,
     DEFAULT_TARGETS,
     _parse_float,
     features_at_timestep,
@@ -82,15 +81,15 @@ from bc_gru_features import (
 )
 
 
-def _discover_segment_csvs(data_dir):
+def _discover_training_csvs(data_dir):
+    """``driving_data.csv`` (calibrated sessions) or ``segment_<n>.csv`` (clean IL segments)."""
     out = []
     for root, _, files in os.walk(data_dir):
         for fn in files:
             if not fn.endswith(".csv"):
                 continue
-            if not re.match(r"segment_\d+\.csv$", fn):
-                continue
-            out.append(os.path.join(root, fn))
+            if fn == "driving_data.csv" or re.match(r"segment_\d+\.csv$", fn):
+                out.append(os.path.join(root, fn))
     return sorted(out)
 
 
@@ -102,7 +101,30 @@ def _extract_driver_id(path):
     return "UNKNOWN"
 
 
-def _build_segment_arrays(csv_path, features, targets):
+def _sorted_rows_times(rows, time_column, fallback_column):
+    ts = [_parse_float(r.get(time_column)) for r in rows]
+    if all(t is not None for t in ts):
+        order = sorted(range(len(rows)), key=lambda i: ts[i])
+        rows_s = [rows[i] for i in order]
+        ts_s = [ts[i] for i in order]
+        return rows_s, ts_s
+    if fallback_column != time_column:
+        ts_fb = [_parse_float(r.get(fallback_column)) for r in rows]
+        if all(t is not None for t in ts_fb):
+            print(
+                "[WARN] column {!r} missing on some rows — sorting with fallback {!r}".format(
+                    time_column,
+                    fallback_column,
+                )
+            )
+            order = sorted(range(len(rows)), key=lambda i: ts_fb[i])
+            rows_s = [rows[i] for i in order]
+            ts_s = [ts_fb[i] for i in order]
+            return rows_s, ts_s
+    return None, None
+
+
+def _build_segment_arrays(csv_path, features, targets, time_column, time_fallback_column):
     rows = []
     with open(csv_path, "r", encoding="utf-8") as f:
         for r in csv.DictReader(f):
@@ -111,7 +133,10 @@ def _build_segment_arrays(csv_path, features, targets):
     if not rows:
         return None, None
 
-    ts = [_parse_float(r.get("timestamp")) for r in rows]
+    rows, ts = _sorted_rows_times(rows, time_column, time_fallback_column)
+    if rows is None:
+        print("[WARN] skip (no monotone time column): {}".format(csv_path))
+        return None, None
 
     x = []
     y = []
@@ -137,12 +162,14 @@ def _build_segment_arrays(csv_path, features, targets):
     return np.asarray(x, dtype=np.float32), np.asarray(y, dtype=np.float32)
 
 
-def _build_samples(segment_paths, features, targets, seq_len):
+def _build_samples(segment_paths, features, targets, seq_len, time_column, time_fallback_column):
     xs = []
     ys = []
     meta = []
     for p in segment_paths:
-        arr_x, arr_y = _build_segment_arrays(p, features, targets)
+        arr_x, arr_y = _build_segment_arrays(
+            p, features, targets, time_column, time_fallback_column
+        )
         if arr_x is None:
             continue
         n = arr_x.shape[0]
@@ -293,12 +320,29 @@ def main():
     ap.add_argument(
         "--data_dir",
         type=str,
-        default="/home/zwx/driver_model/outputs/following_il_clean_gap04",
+        default="/home/zwx/driver_model/following/outputs/following_calibrated",
     )
     ap.add_argument(
         "--out_dir",
         type=str,
-        default="/home/zwx/driver_model/outputs/il_bc_gru",
+        default="/home/zwx/driver_model/following/outputs/il_bc_gru",
+    )
+    ap.add_argument(
+        "--time_column",
+        type=str,
+        default="sim_time_s",
+        help="CSV column to sort rows and (if --with-dt-prev) dt_prev deltas.",
+    )
+    ap.add_argument(
+        "--time_fallback_column",
+        type=str,
+        default="timestamp",
+        help="Fallback time column when --time_column values are missing.",
+    )
+    ap.add_argument(
+        "--with-dt-prev",
+        action="store_true",
+        help="Legacy 8-D input: include dt_prev as first feature (wall-clock or sim deltas).",
     )
     ap.add_argument("--seq_len", type=int, default=20)
     ap.add_argument("--batch_size", type=int, default=256)
@@ -337,11 +381,13 @@ def main():
     torch.manual_seed(args.seed)
 
     os.makedirs(args.out_dir, exist_ok=True)
-    segment_paths = _discover_segment_csvs(args.data_dir)
+    segment_paths = _discover_training_csvs(args.data_dir)
     if args.max_segments and args.max_segments > 0:
         segment_paths = segment_paths[: args.max_segments]
     if not segment_paths:
-        raise RuntimeError("No segment_*.csv found under {}".format(args.data_dir))
+        raise RuntimeError(
+            "No driving_data.csv or segment_*.csv found under {}".format(args.data_dir)
+        )
 
     by_driver = {}
     for p in segment_paths:
@@ -393,7 +439,7 @@ def main():
             )
         )
 
-    features = list(DEFAULT_FEATURES)
+    features = list(DEFAULT_FEATURES_LEGACY if args.with_dt_prev else DEFAULT_FEATURES)
     targets = list(DEFAULT_TARGETS)
     target_weights = [float(x.strip()) for x in args.target_weights.split(",") if x.strip()]
     if len(target_weights) != len(targets):
@@ -402,9 +448,30 @@ def main():
                 len(target_weights), len(targets)
             )
         )
-    train_x, train_y, _ = _build_samples(train_paths, features, targets, args.seq_len)
-    val_x, val_y, _ = _build_samples(val_paths, features, targets, args.seq_len)
-    test_x, test_y, _ = _build_samples(test_paths, features, targets, args.seq_len)
+    train_x, train_y, _ = _build_samples(
+        train_paths,
+        features,
+        targets,
+        args.seq_len,
+        args.time_column,
+        args.time_fallback_column,
+    )
+    val_x, val_y, _ = _build_samples(
+        val_paths,
+        features,
+        targets,
+        args.seq_len,
+        args.time_column,
+        args.time_fallback_column,
+    )
+    test_x, test_y, _ = _build_samples(
+        test_paths,
+        features,
+        targets,
+        args.seq_len,
+        args.time_column,
+        args.time_fallback_column,
+    )
     if train_x is None or val_x is None or test_x is None:
         raise RuntimeError("No valid samples after windowing. Check seq_len / data quality.")
 
@@ -479,6 +546,9 @@ def main():
 
     cfg = {
         "data_dir": args.data_dir,
+        "time_column": args.time_column,
+        "time_fallback_column": args.time_fallback_column,
+        "with_dt_prev": bool(args.with_dt_prev),
         "seq_len": args.seq_len,
         "features": features,
         "targets": targets,

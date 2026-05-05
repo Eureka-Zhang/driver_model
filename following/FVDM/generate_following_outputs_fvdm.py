@@ -18,15 +18,44 @@ with **Δv = v\_lead − v\_ego**.
 **Parameters** are loaded via ``--fvdm_aggregate_json`` (output of
 ``calibrate_fvdm_from_following.py``) or ``--fvdm_params_json`` (single-driver compact JSON).
 
-Example::
+**Common lead (T12 scenario template)** — identical to ``generate_following_outputs_idm.py``: fix
+``--data_dir`` to **one** calibrated session directory whose **lead and world trajectory** define
+the scenario (typically participant **T12**). Each batch run still selects only that subject's row
+from the aggregate JSON via ``--follower_driver``. Do **not** point ``--data_dir`` at Tx if you want
+everyone to face the **same** lead; use the shared folder (often T12) instead.
 
-python3 following/FVDM/generate_following_outputs_fvdm.py \
-  --data_dir following/outputs/following_il_clean_gap04/T1/行车/20260420_151629_751_exp1_f \
-  --follower_driver T1 \
-  --out_dir following/outputs/no_driver_follow_fvdm/T1 \
-  --lateral_mode original_jitter \
-  --lane_center_y -7.625 \
-  --seed 42
+Single-session example::
+
+  python3 following/FVDM/generate_following_outputs_fvdm.py \\
+    --data_dir following/outputs/following_calibrated/T12/行车/20260421_120610_198_exp1_f \\
+    --fvdm_aggregate_json following/outputs/fvdm_calibrated_per_driver.json \\
+    --follower_driver T5 \\
+    --out_dir following/outputs/no_driver_follow_fvdm_common_lead/T5 \\
+    --lateral_mode original_jitter \\
+    --lane_center_y -7.625 \\
+    --seed 42
+
+Batch (same lead for followers T1..T20)::
+
+  COMMON_CASE="/home/zwx/driver_model/following/outputs/following_calibrated/T12/行车/20260421_120610_198_exp1_f"
+  FVDM_JSON="/home/zwx/driver_model/following/outputs/fvdm_calibrated_per_driver.json"
+  OUT_ROOT="/home/zwx/driver_model/following/outputs/no_driver_follow_fvdm_common_lead"
+  for i in $(seq 1 20); do
+    D="T${i}"
+    if ! python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if sys.argv[2] in d.get('drivers',{}) else 1)" \
+        "${FVDM_JSON}" "${D}"; then
+      echo "skip ${D} (no FVDM entry)"
+      continue
+    fi
+    python3 following/FVDM/generate_following_outputs_fvdm.py \
+      --data_dir "${COMMON_CASE}" \
+      --fvdm_aggregate_json "${FVDM_JSON}" \
+      --follower_driver "${D}" \
+      --out_dir "${OUT_ROOT}/${D}" \
+      --lateral_mode original_jitter \
+      --lane_center_y -7.625 \
+      --seed 42
+  done
 """
 from __future__ import print_function
 
@@ -71,6 +100,14 @@ def _parse_float(v):
         return float(s)
     except ValueError:
         return None
+
+
+def _integration_timestamps(rows):
+    """Prefer ``sim_time_s`` (CARLA fixed step); else ``timestamp``."""
+    sts = [_parse_float(r.get("sim_time_s")) for r in rows]
+    if sts and all(x is not None for x in sts):
+        return sts
+    return [_parse_float(r.get("timestamp")) for r in rows]
 
 
 def _row_value(row, key):
@@ -401,7 +438,7 @@ def _finalize_longitudinal_from_roll(rows, ego_v_roll, distance_offset, vmin_mps
             "ego_v_roll length {} != rows {}".format(len(ego_v_roll), len(rows))
         )
     n = len(rows)
-    ts = [_parse_float(r.get("timestamp")) for r in rows]
+    ts = _integration_timestamps(rows)
     acc = [_original_ego_long_accel(r) for r in rows]
     x0 = _parse_float(rows[0].get("ego_pos_x"))
     if x0 is None:
@@ -633,7 +670,15 @@ def _load_fvdm_params_from_compact(abs_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument(
+        "--data_dir",
+        type=str,
+        required=True,
+        help=(
+            "Scenario root whose driving_data / segment CSVs define lead + world. "
+            "For fixed lead for all followers (e.g. T12 template): set this to that session directory."
+        ),
+    )
     ap.add_argument(
         "--out_dir",
         type=str,
@@ -792,7 +837,7 @@ def main():
             if _ek not in fieldnames:
                 fieldnames.append(_ek)
 
-        ts = [_parse_float(r.get("timestamp")) for r in rows]
+        ts = _integration_timestamps(rows)
         n = len(rows)
 
         ex0 = _parse_float(rows[0].get("ego_pos_x"))
@@ -880,7 +925,9 @@ def main():
             if t + 1 < n:
                 if ts[t + 1] is None or ts[t] is None:
                     raise RuntimeError(
-                        "{} timestamps missing during IDM rollout at {}".format(rel_path, t)
+                        "{} integration timestamps missing during FVDM rollout at {}".format(
+                            rel_path, t
+                        )
                     )
                 dt_fwd = max(0.0, ts[t + 1] - ts[t])
                 lv_fwd = lv_use
