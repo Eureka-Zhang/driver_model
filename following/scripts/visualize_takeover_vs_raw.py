@@ -10,10 +10,10 @@ the IDM baseline vs the learned residual.
 
 Usage::
 
-    python3 following/scripts/visualize_takeover_vs_raw.py \\
-        --takeover_dir following/outputs/residual_gru_takeover_20s \\
-        --raw_dir following/outputs/following_calibrated \\
-        --session_index 0 \\
+    python3 following/scripts/visualize_takeover_vs_raw.py \
+        --takeover_dir following/outputs/residual_gru_takeover_20s \
+        --raw_dir following/outputs/following_calibrated \
+        --session_index 0 \
         --takeover_time_s 20.0
 
 Output PNGs go to
@@ -34,9 +34,12 @@ import pandas as pd
 
 def _raw_path_for(driver: str, raw_dir: Path, session_index: int) -> Optional[Path]:
     sessions = sorted(glob.glob(str(raw_dir / driver / "行车" / "*")))
-    if len(sessions) <= session_index:
+    if not sessions:
         return None
-    return Path(sessions[session_index]) / "driving_data.csv"
+    idx = session_index if session_index >= 0 else len(sessions) + session_index
+    if idx < 0 or idx >= len(sessions):
+        return None
+    return Path(sessions[idx]) / "driving_data.csv"
 
 
 def _load_csv(path: Path) -> Optional[pd.DataFrame]:
@@ -195,7 +198,9 @@ def main() -> None:
                     default="/home/zwx/driver_model/following/outputs/following_calibrated")
     ap.add_argument("--out_dir", type=str,
                     default="/home/zwx/driver_model/following/outputs/pictures/residual_gru_takeover_vs_raw")
-    ap.add_argument("--session_index", type=int, default=0)
+    ap.add_argument("--session_index", type=int, default=-1,
+                    help="0-based index of the raw session to compare against. "
+                         "Default -1 = last session (sorted alphabetically).")
     ap.add_argument("--takeover_time_s", type=float, default=20.0)
     ap.add_argument("--drivers", type=str, default="")
     args = ap.parse_args()

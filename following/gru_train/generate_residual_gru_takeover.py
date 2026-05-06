@@ -22,12 +22,12 @@ Usage::
 
   python3 following/gru_train/generate_residual_gru_takeover.py
 
-  python3 following/gru_train/generate_residual_gru_takeover.py \\
-    --calibrated_dir /home/zwx/driver_model/following/outputs/following_calibrated \\
-    --model_root /home/zwx/driver_model/following/outputs/residual_gru_v3 \\
-    --out_dir /home/zwx/driver_model/following/outputs/residual_gru_takeover_20s \\
-    --takeover_time_s 20.0 \\
-    --session_index 0 \\
+  python3 following/gru_train/generate_residual_gru_takeover.py \
+    --calibrated_dir /home/zwx/driver_model/following/outputs/following_calibrated \
+    --model_root /home/zwx/driver_model/following/outputs/residual_gru_v3 \
+    --out_dir /home/zwx/driver_model/following/outputs/residual_gru_takeover_20s \
+    --takeover_time_s 20.0 \
+    --session_index 0 \
     --device cpu
 """
 from __future__ import print_function
@@ -118,8 +118,9 @@ def main():
         help="GRU+IDM takes over at this sim_time_s (rows before are kept as-is).",
     )
     ap.add_argument(
-        "--session_index", type=int, default=0,
-        help="0-based index of the session to use per driver (default 0 = 1st session).",
+        "--session_index", type=int, default=-1,
+        help="0-based index of the session to use per driver. "
+             "Default -1 = last session (sorted alphabetically).",
     )
     ap.add_argument("--device", type=str, default="cpu",
                     choices=["auto", "cuda", "cpu"])
@@ -142,12 +143,17 @@ def main():
 
     for d in selected:
         paths = by_driver.get(d, [])
-        if len(paths) <= args.session_index:
-            print("[SKIP] {} has only {} sessions (need index {}).".format(
+        if not paths:
+            print("[SKIP] {} has no sessions.".format(d))
+            continue
+        # Support negative index (e.g. -1 = last session)
+        idx = args.session_index if args.session_index >= 0 else len(paths) + args.session_index
+        if idx < 0 or idx >= len(paths):
+            print("[SKIP] {} has only {} sessions (index {} out of range).".format(
                 d, len(paths), args.session_index))
             continue
 
-        csv_path = paths[args.session_index]
+        csv_path = paths[idx]
         model_dir = os.path.join(args.model_root, d)
         needed = ("best_model.pt", "model_meta.json", "train_report.json")
         if not all(os.path.isfile(os.path.join(model_dir, f)) for f in needed):

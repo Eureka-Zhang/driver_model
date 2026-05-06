@@ -48,7 +48,7 @@ from ``--idm_dir`` to include the fitted ``T`` parameter as a distance feature.
     python3 following/scripts/cluster_following_style.py
     python3 following/scripts/cluster_following_style.py --data_dir following/outputs/following_calibrated --out_dir ... --plot
 
-    python3 /home/zwx/driver_model/following/scripts/cluster_following_style.py --data_dir /home/zwx/driver_model/following/outputs/following_calibrated --out_dir /home/zwx/driver_model/following/outputs/following_style_clusters --plot
+    python3 /home/zwx/driver_model/following/scripts/cluster_following_style.py --data_dir /home/zwx/driver_model/following/outputs/residual_gru_takeover_20s  --out_dir /home/zwx/driver_model/following/outputs/following_style_clusters_generated_20s --plot
 """
 from __future__ import print_function
 
@@ -169,6 +169,8 @@ def _extract_driver_features(csv_paths, min_speed=2.0, min_gap=1.0):
     return dict(
         # Axis D: Distance preference
         thw_median=float(np.median(thw_samples)) if thw_samples else 0.0,
+        thw_p25=_percentile(thw_samples, 25),
+        gap_p25=_percentile(gap_samples, 25),
         gap_mean=float(np.mean(gap_samples)) if gap_samples else 0.0,
 
         # Axis R: Reactivity
@@ -193,7 +195,7 @@ def _extract_driver_features(csv_paths, min_speed=2.0, min_gap=1.0):
 # ======================================================================
 
 # Features used for each axis (keys into the feature dict)
-AXIS_D_FEATURES = ["thw_median", "gap_mean"]
+AXIS_D_FEATURES = ["thw_median", "gap_p25"]
 AXIS_R_FEATURES = ["acc_std", "jerk_p75", "acc_range"]
 AXIS_C_FEATURES = ["inv_ttc_p90", "decel_p90"]
 
@@ -261,16 +263,45 @@ def _assign_labels(sorted_results):
     return labels
 
 
-def _find_prototypes(sorted_results, labels):
-    """Find the driver closest to the group mean score for each label."""
+def _find_prototypes(sorted_results, labels, exclude_outliers=True):
+    """Find the driver that best represents each group.
+
+    For conservative: prefer high D AND low R AND low C (all axes aligned).
+    For aggressive: prefer low D AND high R AND high C.
+    For neutral: closest to overall zero on all axes.
+
+    If exclude_outliers=True, skip drivers whose score is >2 std from the
+    group mean (they are extreme outliers, not "typical" representatives).
+    """
     groups = {}
     for r in sorted_results:
         lbl = labels[r["driver"]]
         groups.setdefault(lbl, []).append(r)
+
     prototypes = {}
     for lbl, members in groups.items():
-        mean_score = np.mean([m["score"] for m in members])
-        best = min(members, key=lambda m: abs(m["score"] - mean_score))
+        candidates = list(members)
+
+        # Exclude outliers: remove drivers whose score is >2 std from group mean
+        if exclude_outliers and len(candidates) > 2:
+            scores = [m["score"] for m in candidates]
+            mean_s = sum(scores) / len(scores)
+            std_s = (sum((s - mean_s) ** 2 for s in scores) / len(scores)) ** 0.5
+            if std_s > 1e-6:
+                candidates = [m for m in candidates
+                              if abs(m["score"] - mean_s) <= 2.0 * std_s]
+            if not candidates:
+                candidates = list(members)  # fallback
+
+        if lbl == "conservative":
+            # Want high D, low R, low C — but not extreme
+            best = max(candidates, key=lambda m: m["D"] - m["R"] - m["C"])
+        elif lbl == "aggressive":
+            # Want low D, high R, high C — but not extreme
+            best = max(candidates, key=lambda m: m["R"] + m["C"] - m["D"])
+        else:
+            # Neutral: closest to zero on all axes
+            best = min(candidates, key=lambda m: abs(m["D"]) + abs(m["R"]) + abs(m["C"]))
         prototypes[lbl] = best["driver"]
     return prototypes
 
