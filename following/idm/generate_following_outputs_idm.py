@@ -13,35 +13,12 @@ Closed-loop integration uses **`sim_time_s` when every row has it** (uniform sim
 calibrated exports); otherwise falls back to **`timestamp`** (wall clock).
 
 Example::
-
-  python3 following/idm/generate_following_outputs_idm.py \\
-    --data_dir /path/to/common_case_session \\
-    --idm_dir /path/to/outputs/idm_per_driver \\
-    --follower_driver T5 \\
-    --out_dir /path/to/out/T5 \\
-    --lateral_mode original_jitter \\
-    --lane_center_y -7.625 \\
-    --seed 42
-    
-    
-COMMON_CASE="/home/zwx/driver_model/following/outputs/following_calibrated/T12/行车/20260421_120610_198_exp1_f"
-IDM_ROOT="/home/zwx/driver_model/following/outputs/idm_per_driver"
-OUT_ROOT="/home/zwx/driver_model/following/outputs/no_driver_follow_idm_common_lead"
-for i in $(seq 1 20); do
-  D="T${i}"
-  if [ ! -f "${IDM_ROOT}/${D}/idm.json" ]; then
-    echo "skip ${D} (no idm.json)"
-    continue
-  fi
-  python3 /home/zwx/driver_model/following/idm/generate_following_outputs_idm.py \
-    --data_dir "${COMMON_CASE}" \
-    --idm_dir "${IDM_ROOT}" \
-    --follower_driver "${D}" \
-    --out_dir "${OUT_ROOT}/${D}" \
-    --lateral_mode original_jitter \
-    --lane_center_y -7.625 \
-    --seed 42
-done
+python3 following/idm/generate_idm_takeover_per_driver.py \
+  --calibrated_dir following/outputs/following_calibrated \
+  --idm_dir following/outputs/idm_per_driver \
+  --out_dir following/outputs/idm_takeover_25s \
+  --takeover_time_s 25.0 \
+  --session_index 2
 """
 from __future__ import print_function
 

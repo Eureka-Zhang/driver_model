@@ -39,9 +39,11 @@ Calibrate following (跟驰) driving_data.csv trajectories.
   value is finite ``> 0`` and not the ``999`` sentinel; otherwise **0** (same rule as
   ``clean_following_for_imitation.py``).
 
-Adds ``sim_time_s``: simulation elapsed time (seconds), ``row_index * sim_dt_s`` (default 0.05 s
-per row, matching ``replay/experiment.py`` sync ``fixed_delta_seconds``). Kinematic differencing
-(vel/accel/jerk/yaw_rate) uses this uniform timeline instead of the wall-clock ``timestamp`` column.
+Adds ``sim_time_s``: ``frame * sim_dt_s`` (default ``sim_dt_s = 0.05`` s, i.e. frame × 0.05),
+using the CSV ``frame`` column when present; if ``frame`` is missing on a row, falls back to
+that row's zero-based CSV order index ``i`` (same as ``i * sim_dt_s``). No time-based row dropping
+here—crop or filter downstream if needed. Kinematic differencing (vel/accel/jerk/yaw_rate) uses this
+``ts`` timeline instead of wall-clock ``timestamp``.
 
 Does not modify: lead position/speed columns aside from derived long/lat here, throttle, brake,
 longitudinal_control, control_mode, gear, lead_behavior_mode, real_world_* , frame, original ``timestamp``.
@@ -73,6 +75,11 @@ import csv
 import math
 import os
 import re
+
+try:
+    import numpy as _np
+except Exception:
+    _np = None
 
 def discover_following_csvs(data_dir):
     """Same discovery as filter_following_right_lane (no pre_familiarization, no overtaking/_o)."""
@@ -266,6 +273,101 @@ def _clean_acceleration(values, median_window, smooth_window, clip_min, clip_max
     return values
 
 
+def _hampel_filter(values, window, n_sigmas):
+    """Robust Hampel outlier replacement.
+
+    Replaces any sample farther than ``n_sigmas * 1.4826 * MAD`` from the
+    centered window median with that median. ``window`` is the full window
+    size (odd; <=1 disables). Preserves non-spike dynamics exactly.
+    """
+    if window is None or window <= 1 or n_sigmas is None or n_sigmas <= 0:
+        return list(values)
+    n = len(values)
+    if n == 0:
+        return []
+    if window % 2 == 0:
+        window += 1
+    half = window // 2
+    k = 1.4826
+    out = list(values)
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        win = values[lo:hi]
+        m = sorted(win)[len(win) // 2]
+        mad = sorted(abs(x - m) for x in win)[len(win) // 2]
+        if mad > 0.0 and abs(values[i] - m) > n_sigmas * k * mad:
+            out[i] = m
+    return out
+
+
+def _savgol_smooth(values, window, poly):
+    """Savitzky-Golay low-pass smoother (order ``poly`` polynomial over ``window``).
+
+    Pure ``numpy`` implementation so no ``scipy`` dependency. Returns ``values``
+    unchanged if numpy is missing, window is too small, or poly >= window.
+    Uses edge reflection so length is preserved.
+    """
+    if _np is None or window is None or window <= 1:
+        return list(values)
+    if window % 2 == 0:
+        window += 1
+    if poly < 1:
+        poly = 1
+    if poly >= window:
+        return list(values)
+    n = len(values)
+    if n == 0:
+        return []
+    arr = _np.asarray(values, dtype=float)
+    half = window // 2
+    if n < window:
+        pad = min(half, n - 1)
+        left = arr[1:pad + 1][::-1] if pad > 0 else _np.empty(0)
+        right = arr[-pad - 1:-1][::-1] if pad > 0 else _np.empty(0)
+        arr = _np.concatenate([left, arr, right])
+        n = arr.shape[0]
+        half = min(half, n // 2)
+        window = 2 * half + 1
+
+    # Least-squares Savitzky-Golay coefficients for the centered window.
+    offsets = _np.arange(-half, half + 1, dtype=float)
+    A = _np.vander(offsets, poly + 1, increasing=True)
+    pinv = _np.linalg.pinv(A)
+    coeffs = pinv[0]
+
+    padded = _np.concatenate([arr[half:0:-1], arr, arr[-2:-half - 2:-1]])
+    out = _np.convolve(padded, coeffs[::-1], mode="valid")
+    out = out[: len(values)]
+    return out.tolist()
+
+
+def _advanced_acceleration_clean(
+    values,
+    hampel_window,
+    hampel_nsigmas,
+    savgol_window,
+    savgol_poly,
+    median_window,
+    smooth_window,
+    clip_min,
+    clip_max,
+):
+    """Outlier-robust acceleration cleanup.
+
+    Pipeline: Hampel -> Savitzky-Golay -> light median -> light MA -> clip.
+    The Hampel+SavGol pair kills spikes while preserving real transients
+    (braking/throttle onsets) far better than a wide plain MA, so velocity
+    and distance integrals stay close to the raw signal.
+    """
+    values = _hampel_filter(values, hampel_window, hampel_nsigmas)
+    values = _savgol_smooth(values, savgol_window, savgol_poly)
+    values = _median_filter(values, median_window)
+    values = _moving_average(values, smooth_window)
+    values = _clip(values, clip_min, clip_max)
+    return values
+
+
 def _finite_diff_vx_vy(ts, xs, ys, n):
     """Per-sample vx, vy in m/s (world frame)."""
     vx = [0.0] * n
@@ -409,13 +511,19 @@ def calibrate_rows(
     steer_smooth_window,
     road_heading_deg,
     sim_dt_s,
+    acc_hampel_window=9,
+    acc_hampel_nsigmas=3.0,
+    acc_savgol_window=11,
+    acc_savgol_poly=2,
+    vel_smooth_window=7,
 ):
     """
     rows_dicts: list of dicts with CSV columns.
     Returns new list of dicts (copies).
 
-    ``sim_dt_s``: fixed simulation seconds per row; time axis for derivatives is
-    ``ts[i] = i * sim_dt_s`` (wall-clock ``timestamp`` is not used for differencing).
+    ``sim_dt_s``: multiplier for simulation time per frame step; time axis for derivatives is
+    ``ts[i] = frame_i * sim_dt_s`` when ``frame`` parses on row ``i``, else ``i * sim_dt_s``.
+    Wall-clock ``timestamp`` is not used for differencing.
     """
     n = len(rows_dicts)
     if n == 0:
@@ -425,7 +533,12 @@ def calibrate_rows(
         sim_dt_s = 0.05
     sim_dt_s = float(sim_dt_s)
 
-    ts = [i * sim_dt_s for i in range(n)]
+    ts = []
+    for i in range(n):
+        fr = _parse_float(rows_dicts[i].get("frame"))
+        if fr is None:
+            fr = float(i)
+        ts.append(float(fr) * sim_dt_s)
     xs = []
     ys_raw = []
     lead_xs = []
@@ -494,11 +607,14 @@ def calibrate_rows(
         lead_v_long[i] = lvl
         lead_v_lat[i] = lvlat
 
-    # Light smoothing on projected velocities before differentiating again (accel).
-    ego_v_long = _moving_average(ego_v_long, 3)
-    ego_v_lat = _moving_average(ego_v_lat, 3)
-    lead_v_long = _moving_average(lead_v_long, 3)
-    lead_v_lat = _moving_average(lead_v_lat, 3)
+    # Smooth projected velocities before differentiating (accel).
+    # vel_smooth_window controls how much the speed is low-passed before diff;
+    # larger = smoother accel but slightly rounded speed transients.
+    vsw = max(3, int(vel_smooth_window))
+    ego_v_long = _moving_average(ego_v_long, vsw)
+    ego_v_lat = _moving_average(ego_v_lat, vsw)
+    lead_v_long = _moving_average(lead_v_long, vsw)
+    lead_v_lat = _moving_average(lead_v_lat, vsw)
 
     # Accel aligns with emitted ``ego_v_*`` / ``lead_v_*``: CSV stores |projected v| on both
     # axes. Differentiating signed projection while heading opposes ``road_heading_deg``
@@ -512,12 +628,50 @@ def calibrate_rows(
     lead_a_long = _derivative(ts, lead_v_long_mag)
     lead_a_lat = _derivative(ts, lead_v_lat_mag)
 
-    ego_a_long = _clean_acceleration(
-        ego_a_long, acc_median_window, acc_smooth_window, acc_clip_min, acc_clip_max
+    ego_a_long = _advanced_acceleration_clean(
+        ego_a_long,
+        acc_hampel_window,
+        acc_hampel_nsigmas,
+        acc_savgol_window,
+        acc_savgol_poly,
+        acc_median_window,
+        acc_smooth_window,
+        acc_clip_min,
+        acc_clip_max,
     )
-    ego_a_lat = _moving_average(_median_filter(ego_a_lat, acc_median_window), acc_smooth_window)
-    lead_a_long = _moving_average(_median_filter(lead_a_long, acc_median_window), acc_smooth_window)
-    lead_a_lat = _moving_average(_median_filter(lead_a_lat, acc_median_window), acc_smooth_window)
+    ego_a_lat = _advanced_acceleration_clean(
+        ego_a_lat,
+        acc_hampel_window,
+        acc_hampel_nsigmas,
+        acc_savgol_window,
+        acc_savgol_poly,
+        acc_median_window,
+        acc_smooth_window,
+        acc_clip_min,
+        acc_clip_max,
+    )
+    lead_a_long = _advanced_acceleration_clean(
+        lead_a_long,
+        acc_hampel_window,
+        acc_hampel_nsigmas,
+        acc_savgol_window,
+        acc_savgol_poly,
+        acc_median_window,
+        acc_smooth_window,
+        acc_clip_min,
+        acc_clip_max,
+    )
+    lead_a_lat = _advanced_acceleration_clean(
+        lead_a_lat,
+        acc_hampel_window,
+        acc_hampel_nsigmas,
+        acc_savgol_window,
+        acc_savgol_poly,
+        acc_median_window,
+        acc_smooth_window,
+        acc_clip_min,
+        acc_clip_max,
+    )
     relative_v_long = [lead_v_long[i] - ego_v_long[i] for i in range(n)]
 
     # Use decomposed longitudinal acceleration for modeling. The original
@@ -651,6 +805,38 @@ def main():
         help="Maximum ego_acceleration after cleaning (m/s^2)",
     )
     ap.add_argument(
+        "--acc_hampel_window",
+        type=int,
+        default=9,
+        help="Hampel (rolling MAD) outlier detection window for acceleration; 1 disables.",
+    )
+    ap.add_argument(
+        "--acc_hampel_nsigmas",
+        type=float,
+        default=3.0,
+        help="Hampel threshold in robust sigmas (1.4826*MAD); samples farther are replaced by window median.",
+    )
+    ap.add_argument(
+        "--acc_savgol_window",
+        type=int,
+        default=11,
+        help="Savitzky-Golay window for acceleration (odd; 1 disables).",
+    )
+    ap.add_argument(
+        "--acc_savgol_poly",
+        type=int,
+        default=2,
+        help="Savitzky-Golay polynomial order (e.g. 2); requires poly < window.",
+    )
+    ap.add_argument(
+        "--vel_smooth_window",
+        type=int,
+        default=7,
+        help="Moving-average window on projected velocities BEFORE differentiating to get accel. "
+        "Larger = smoother accel (less jerk) but slightly rounded speed transients. "
+        "3 = minimal (old default); 7~11 recommended for IDM/GRU residual work.",
+    )
+    ap.add_argument(
         "--kinematics_mode",
         type=str,
         default="preserve",
@@ -700,9 +886,9 @@ def main():
         default=0.05,
         metavar="SEC",
         help=(
-            "Seconds of simulation time per CSV row (CARLA sync fixed_delta_seconds). "
-            "Builds sim_time_s = row_index * sim_dt_s and uses this uniform axis for all "
-            "kinematic derivatives (replacing wall-clock timestamp differencing)."
+            "Multiplier for simulated time vs frame index (CARLA sync fixed_delta_seconds, default 0.05). "
+            "sim_time_s = frame * sim_dt_s using CSV column ``frame``; missing frame falls back "
+            "to row order index i (i * sim_dt_s). No row cropping by time in this script."
         ),
     )
     args = ap.parse_args()
@@ -765,6 +951,11 @@ def main():
             steer_smooth_window=args.steer_smooth_window,
             road_heading_deg=args.road_heading_deg,
             sim_dt_s=args.sim_dt_s,
+            acc_hampel_window=args.acc_hampel_window,
+            acc_hampel_nsigmas=args.acc_hampel_nsigmas,
+            acc_savgol_window=args.acc_savgol_window,
+            acc_savgol_poly=args.acc_savgol_poly,
+            vel_smooth_window=args.vel_smooth_window,
         )
         # Ensure schema includes every key on output rows; drop stale ``*_valid`` from input lists.
         _no_valid = tuple(f for f in fieldnames if f not in ("ttc_valid", "time_headway_valid"))

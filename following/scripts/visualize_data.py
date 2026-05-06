@@ -11,6 +11,9 @@ import matplotlib.pyplot as plt
 # Whole tree (same layout as outputs from generate_* under a driver/session root):
 #   python .../visualize_data.py path/to/personalized_no_driver_tcn_common_lead --no-smooth
 # Saves PNGs under outputs/pictures/<DIR_BASENAME>/... mirroring paths inside DIR.
+'''
+python /home/zwx/driver_model/following/scripts/visualize_data.py   /home/zwx/driver_model/following/outputs/residual_gru_takeover_20s/ --no-smooth
+'''
 
 try:
     from scipy.signal import savgol_filter as _savgol_filter

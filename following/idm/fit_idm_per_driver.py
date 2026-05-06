@@ -5,15 +5,13 @@ following trajectories: ``**/segment_<n>.csv`` (imitation-clean) or ``**/driving
 (calibrated sessions). Rows are sorted by ``sim_time_s`` when present (--time-column),
 else ``timestamp``, before pooling samples.
 
-**Default calibration (two stages)**
+When ``--min_sim_time_s`` is greater than 0 (default **25**), only rows whose time from
+``--time_column`` (fallback ``--time_fallback_column`` if primary missing on that row) is
+**>= that value** are kept; rows with missing time are dropped.
+Pass ``--min_sim_time_s 0`` to use all samples (no time filter).
 
-1. **Physics / habits** — Robust quantiles on "limit-operation" rows set ``a`` and ``b``
-   (not optimized with Adam).
-2. **Psycho-gap** — Fix ``a``, ``b``, and ``delta``, then optimize ``v0, s0, T`` with Adam
-   and **weighted** acceleration MSE: ``1 + w_clamp * |a_meas|``.
-
-Pass ``--legacy_joint_fit`` for the older single-phase joint fit in
-``(v0,s0,a,b,T[,delta])``.
+**Calibration**: joint Adam on ``(v0,s0,a,b,T)`` with optional fixed ``delta`` (--delta_fixed>0),
+or also fit ``delta`` when ``--delta_fixed`` is 0 or negative.
 
 Uses the textbook acceleration law (same unit convention as calibrated IL CSV):
 
@@ -229,6 +227,15 @@ def _sort_rows_by_time(rows, primary, fallback):
     return rows
 
 
+def _row_time_value(row, primary, fallback):
+    """Simulation/wall time for one row: ``primary`` column, then ``fallback``."""
+    t = _parse_float(row.get(primary))
+    if t is not None:
+        return float(t)
+    fb = _parse_float(row.get(fallback))
+    return float(fb) if fb is not None else None
+
+
 def _extract_driver_id(path):
     p = path.replace("\\", "/")
     m = re.search(r"/(T\d+)(?:/|$)", p)
@@ -331,86 +338,6 @@ def _fit_joint_idm_restart(
     return rmse, loss_best, params
 
 
-def _fit_psycho_idm_restart(
-    v_np,
-    vl_np,
-    g_np,
-    a_np,
-    bounds,
-    rest_mask,
-    n_epochs,
-    lr,
-    a_fixed,
-    b_fixed,
-    delta_fixed,
-    device,
-    loss_weight_accel_scale=3.0,
-):
-    """
-    Fix a, b, delta; optimize v0, s0, T only. Loss = sum w_i (pred-obs)^2 / sum w_i with
-    w_i = mask * (1 + loss_weight_accel_scale * |a_obs|).
-    """
-    nv = torch.as_tensor(v_np, dtype=torch.float32, device=device)
-    nl = torch.as_tensor(vl_np, dtype=torch.float32, device=device)
-    ng = torch.as_tensor(g_np, dtype=torch.float32, device=device)
-    na = torch.as_tensor(a_np, dtype=torch.float32, device=device)
-    nm = torch.as_tensor(rest_mask.astype(np.float32), dtype=torch.float32, device=device)
-
-    n_param_raw = len(bounds)
-    raw = torch.nn.Parameter(torch.zeros(n_param_raw, device=device))
-    with torch.no_grad():
-        raw.copy_(torch.randn(n_param_raw, device=device) * 0.35)
-
-    att = torch.tensor(float(a_fixed), dtype=torch.float32, device=device)
-    bt = torch.tensor(float(b_fixed), dtype=torch.float32, device=device)
-    deltat = torch.tensor(float(delta_fixed), dtype=torch.float32, device=device)
-
-    optimizer = torch.optim.Adam([raw], lr=float(lr))
-    loss_best = math.inf
-    scale = float(loss_weight_accel_scale)
-
-    def _forward():
-        v0t, s0t, Tt = _box_params(raw.unsqueeze(0), bounds)
-        pred = idm_accel_torch(nv, nl, ng, v0t, s0t, att, bt, Tt, deltat)
-        resid = pred - na
-        w_ij = nm * (1.0 + scale * torch.abs(na))
-        denom_w = torch.clamp(torch.sum(w_ij), min=1e-6)
-        loss_w = torch.sum((resid ** 2) * w_ij) / denom_w
-        return loss_w, pred.detach()
-
-    for ep in range(n_epochs):
-        optimizer.zero_grad()
-        loss, _ = _forward()
-        loss.backward()
-        optimizer.step()
-        lb = loss.item()
-        if lb < loss_best:
-            loss_best = lb
-
-    with torch.no_grad():
-        _, pred_f = _forward()
-        resid_f = pred_f - na
-        denom_u = torch.clamp(nm.sum(), min=1.0)
-        rmse_unweighted = float(
-            torch.sqrt(torch.sum((resid_f ** 2) * nm) / denom_u).item()
-        )
-
-    with torch.no_grad():
-        v0t, s0t, Tt = _box_params(raw.unsqueeze(0), bounds)
-        v0 = float(v0t.squeeze().item())
-        s0 = float(s0t.squeeze().item())
-        T = float(Tt.squeeze().item())
-    params = dict(
-        v0=v0,
-        s0=s0,
-        a=float(a_fixed),
-        b=float(b_fixed),
-        T=T,
-        delta=float(delta_fixed),
-    )
-    return rmse_unweighted, loss_best, params
-
-
 def extract_samples_from_segments(
     paths,
     gap_min,
@@ -419,7 +346,9 @@ def extract_samples_from_segments(
     vmax_gap_outlier_speed,
     time_column="sim_time_s",
     time_fallback_column="timestamp",
+    min_sim_time_s=None,
 ):
+    """Keep rows with ``time_column`` (fallback) ``>= min_sim_time_s`` when set and ``> 0``."""
     v_list = []
     vl_list = []
     g_list = []
@@ -436,7 +365,12 @@ def extract_samples_from_segments(
             continue
         rows = [hydrate_following_row(dict(r)) for r in rows]
         rows = _sort_rows_by_time(rows, time_column, time_fallback_column)
+        min_keep = float(min_sim_time_s)
         for r in rows:
+            if min_sim_time_s is not None and float(min_sim_time_s) > 0.0:
+                t_row = _row_time_value(r, time_column, time_fallback_column)
+                if t_row is None or t_row < min_keep:
+                    continue
             ev = _row_value_csv(r, "ego_v_long")
             if ev is None:
                 ev = _parse_float(r.get("ego_speed"))
@@ -477,161 +411,6 @@ def extract_samples_from_segments(
     )
 
 
-def extract_longitudinal_rows_for_ab_priors(
-    paths,
-    vmax_cap,
-    time_column="sim_time_s",
-    time_fallback_column="timestamp",
-):
-    """
-    All timesteps with ego/lead speeds and ego acceleration (no gap filter), for Stage-1 AB stats.
-    """
-    ev_list = []
-    lv_list = []
-    a_list = []
-    for fp in paths:
-        rows = []
-        with open(fp, "r", encoding="utf-8") as f:
-            rd = csv.DictReader(f)
-            if rd.fieldnames is None:
-                continue
-            rows = list(rd)
-        if not rows:
-            continue
-        rows = [hydrate_following_row(dict(r)) for r in rows]
-        rows = _sort_rows_by_time(rows, time_column, time_fallback_column)
-        for r in rows:
-            ev = _row_value_csv(r, "ego_v_long")
-            if ev is None:
-                ev = _parse_float(r.get("ego_speed"))
-            lv = _row_value_csv(r, "lead_v_long")
-            if lv is None:
-                lv = _parse_float(r.get("lead_speed"))
-            accel = _row_value_csv(r, "ego_a_long")
-            if accel is None:
-                accel = _parse_float(r.get("ego_acceleration"))
-            if ev is None or lv is None or accel is None:
-                continue
-            fv = float(ev)
-            fu = float(lv)
-            fa = float(accel)
-            if abs(fv) > vmax_cap or abs(fu) > vmax_cap or not math.isfinite(fv + fu + fa):
-                continue
-            ev_list.append(fv)
-            lv_list.append(fu)
-            a_list.append(fa)
-
-    if not ev_list:
-        return None
-    return (
-        np.asarray(ev_list, dtype=np.float64),
-        np.asarray(lv_list, dtype=np.float64),
-        np.asarray(a_list, dtype=np.float64),
-    )
-
-
-def _finite_quantile(x, q):
-    x = np.asarray(x, dtype=np.float64)
-    x = x[np.isfinite(x)]
-    if x.size == 0:
-        return None
-    return float(np.quantile(x, q))
-
-
-def compute_ab_priors_numpy(
-    ego_v,
-    lead_v,
-    ego_a,
-    bounds_a,
-    bounds_b,
-    accel_pos_thresh=0.3,
-    accel_neg_thresh=-0.3,
-    rel_speed_max=-0.5,
-    vmax_margin=5.0,
-    qa=0.95,
-    qb=0.90,
-    min_scene=15,
-):
-    """
-    Stage 1: scenario quantiles on longitudinal rows (numpy; no pandas).
-    """
-    lo_a, hi_a = bounds_a
-    lo_b, hi_b = bounds_b
-    rel = lead_v - ego_v
-    vmax = float(np.nanmax(ego_v)) if ego_v.size else 0.0
-
-    scenario_a = (ego_a > accel_pos_thresh) & (ego_v < (vmax - vmax_margin)) & np.isfinite(ego_a)
-    scenario_b = (
-        (ego_a < accel_neg_thresh) & (rel < rel_speed_max) & np.isfinite(ego_a) & np.isfinite(rel)
-    )
-
-    accel_a_samples = ego_a[scenario_a]
-    decel_samples = ego_a[scenario_b]
-
-    meta = dict(
-        n_rows_total=int(ego_v.size),
-        n_scenario_accel=int(accel_a_samples.size),
-        n_scenario_brake=int(decel_samples.size),
-        vmax_ego=float(vmax),
-        a_fallback="quantile_accel_scene",
-        b_fallback="quantile_brake_scene",
-    )
-
-    a_stat = (
-        _finite_quantile(accel_a_samples, qa) if accel_a_samples.size >= min_scene else None
-    )
-    b_stat = (
-        _finite_quantile(np.abs(decel_samples), qb) if decel_samples.size >= min_scene else None
-    )
-
-    if a_stat is None:
-        widen = ego_a[
-            (ego_a > max(0.05, accel_pos_thresh * 0.5))
-            & (ego_v < max(0.0, vmax - max(2.0, vmax_margin * 0.5)))
-            & np.isfinite(ego_a)
-        ]
-        a_stat = _finite_quantile(widen, min(qa, 0.93))
-        meta["a_fallback"] = "widen_accel_floor"
-        if a_stat is None:
-            pos = ego_a[(ego_a > 0.05) & np.isfinite(ego_a)]
-            a_stat = _finite_quantile(pos, min(qa, 0.90))
-            meta["a_fallback"] = "all_mild_positive_accel"
-        if a_stat is None or not math.isfinite(a_stat):
-            a_stat = max(lo_a, min(hi_a, 2.0))
-            meta["a_fallback"] = "constant_mid"
-
-    if b_stat is None:
-        widen_b = ego_a[
-            (ego_a < min(-0.15, accel_neg_thresh * 0.5))
-            & (rel < max(rel_speed_max, -0.25))
-            & np.isfinite(ego_a)
-        ]
-        b_stat = _finite_quantile(np.abs(widen_b), min(qb, 0.88))
-        meta["b_fallback"] = "widen_brake_rel_speed"
-        if b_stat is None:
-            neg = ego_a[(ego_a < -0.05) & np.isfinite(ego_a)]
-            b_stat = _finite_quantile(np.abs(neg), min(qb, 0.85))
-            meta["b_fallback"] = "all_decel"
-        if b_stat is None or not math.isfinite(b_stat):
-            b_stat = max(lo_b, min(hi_b, 2.0))
-            meta["b_fallback"] = "constant_mid"
-
-    a_stat = float(max(lo_a, min(hi_a, a_stat)))
-    b_stat = float(max(lo_b, min(hi_b, b_stat)))
-    meta.update(
-        a_stat=a_stat,
-        b_stat=b_stat,
-        qa=qa,
-        qb=qb,
-        accel_pos_thresh=accel_pos_thresh,
-        accel_neg_thresh=accel_neg_thresh,
-        rel_speed_max=rel_speed_max,
-        vmax_margin=vmax_margin,
-        min_scene=min_scene,
-    )
-    return meta
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -643,7 +422,7 @@ def main():
         "--time_column",
         type=str,
         default="sim_time_s",
-        help="Sort rows within each CSV by this column when all values parse (sim grid).",
+        help="Sort/filter rows by this column when present per row (default sim_time_s); see --min_sim_time_s.",
     )
     ap.add_argument(
         "--time_fallback_column",
@@ -678,48 +457,16 @@ def main():
         "--delta_fixed",
         type=float,
         default=4.0,
-        help="Exponent delta fixed at this value when >0 (default for both modes). Legacy: "
-        "if <=0, also fit delta in [2,6]. Two-stage: if <=0, uses 4.0 here.",
+        help="If >0, freeze exponent at this value. If <=0, also fit delta in [2,6].",
+    )
+    ap.add_argument(
+        "--min_sim_time_s",
+        type=float,
+        default=25.0,
+        help="Use only rows with time >= this (s): --time_column, else --time_fallback_column on that row. 0 disables.",
     )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", type=str, default="cpu")
-    ap.add_argument(
-        "--legacy_joint_fit",
-        action="store_true",
-        help="Original single-phase Adam on (v0,s0,a,b,T[,delta]); default is two-stage AB quantiles + psycho fit.",
-    )
-    ap.add_argument(
-        "--loss_weight_accel",
-        type=float,
-        default=3.0,
-        help="Two-stage psycho loss: weight multiplier on |a_obs| (w = 1 + k*|a|).",
-    )
-    ap.add_argument("--ab_accel_pos", type=float, default=0.3, help="Scenario A: ego_acceleration > this.")
-    ap.add_argument(
-        "--ab_accel_neg", type=float, default=-0.3, help="Scenario B: ego_acceleration < this (negative)."
-    )
-    ap.add_argument(
-        "--ab_rel_speed_max",
-        type=float,
-        default=-0.5,
-        help="Scenario B: lead_speed - ego_speed < this (closing on slower lead).",
-    )
-    ap.add_argument(
-        "--ab_vmax_margin",
-        type=float,
-        default=5.0,
-        help="Scenario A: ego_speed < max(ego_speed in data) minus this margin.",
-    )
-    ap.add_argument("--ab_q_a", type=float, default=0.95, help="Quantile for a_stat (Scenario A accel).")
-    ap.add_argument(
-        "--ab_q_b", type=float, default=0.90, help="Quantile for |decel| (Scenario B braking)."
-    )
-    ap.add_argument(
-        "--ab_min_scene",
-        type=int,
-        default=15,
-        help="Minimum rows in a scenario before trusting the quantile.",
-    )
     args = ap.parse_args()
 
     rng_main = random.Random(args.seed)
@@ -763,48 +510,35 @@ def main():
     bounds_joint_T = (0.35, 4.5)
     bounds_delta = (2.0, 6.0)
 
-    psycho_v0_bounds = (10.0, 40.0)
-    psycho_s0_bounds = (0.5, 8.0)
-    psycho_T_bounds = (0.5, 4.0)
-
-    if args.legacy_joint_fit:
-        if args.delta_fixed and args.delta_fixed > 0:
-            fit_bounds_joint = [
-                bounds_joint_v0,
-                bounds_joint_s0,
-                bounds_a,
-                bounds_b,
-                bounds_joint_T,
-            ]
-            delta_joint = float(args.delta_fixed)
-        else:
-            fit_bounds_joint = [
-                bounds_joint_v0,
-                bounds_joint_s0,
-                bounds_a,
-                bounds_b,
-                bounds_joint_T,
-                bounds_delta,
-            ]
-            delta_joint = None
+    if args.delta_fixed and args.delta_fixed > 0:
+        fit_bounds_joint = [
+            bounds_joint_v0,
+            bounds_joint_s0,
+            bounds_a,
+            bounds_b,
+            bounds_joint_T,
+        ]
+        delta_joint = float(args.delta_fixed)
     else:
-        fit_bounds_joint = None
+        fit_bounds_joint = [
+            bounds_joint_v0,
+            bounds_joint_s0,
+            bounds_a,
+            bounds_b,
+            bounds_joint_T,
+            bounds_delta,
+        ]
         delta_joint = None
+
+    trim_s = args.min_sim_time_s if args.min_sim_time_s and args.min_sim_time_s > 0 else None
 
     os.makedirs(args.out_dir, exist_ok=True)
     aggregate = dict(
-        version=3 if args.legacy_joint_fit else 2,
-        calibration="legacy_joint_fit"
-        if args.legacy_joint_fit
-        else "two_stage_ab_quantile_psycho",
+        version=4,
+        calibration="joint_adam",
+        min_sim_time_s=trim_s,
         data_dir=os.path.abspath(args.data_dir),
-        legacy_joint_fit=bool(args.legacy_joint_fit),
-        bounds_ab_box=[list(bounds_a), list(bounds_b)],
-        psycho_bounds_default={
-            "v0": list(psycho_v0_bounds),
-            "s0": list(psycho_s0_bounds),
-            "T": list(psycho_T_bounds),
-        },
+        joint_bounds_ab=[list(bounds_a), list(bounds_b)],
         drivers=[],
     )
 
@@ -820,6 +554,7 @@ def main():
             args.max_speed_keep,
             time_column=args.time_column,
             time_fallback_column=args.time_fallback_column,
+            min_sim_time_s=trim_s,
         )
         if pack is None or len(pack[0]) < 50:
             print(
@@ -833,67 +568,14 @@ def main():
 
         median_v = float(np.median(np.abs(v_np)))
         vmax_obs = float(np.percentile(np.abs(v_np), 98))
-
-        if args.legacy_joint_fit:
-            v0_prior_lo = bounds_joint_v0[0]
-            v0_prior_hi = min(
-                bounds_joint_v0[1],
-                max(vmax_obs * 1.4 + 5.0, median_v + 18.0),
-            )
-            drv_bounds = list(fit_bounds_joint)
-            drv_bounds[0] = (v0_prior_lo, v0_prior_hi)
-            ab_prior = None
-            a_fix = None
-            b_fix = None
-            delta_stage2 = None
-            fit_bounds_note = str(drv_bounds)
-        else:
-            ab_pack = extract_longitudinal_rows_for_ab_priors(
-                paths,
-                args.max_speed_keep,
-                time_column=args.time_column,
-                time_fallback_column=args.time_fallback_column,
-            )
-            if ab_pack is None or len(ab_pack[0]) < 30:
-                print(
-                    "[WARN] {} insufficient AB-prior longitudinal rows ({}) skipped.".format(
-                        d, len(ab_pack[0]) if ab_pack else 0
-                    )
-                )
-                continue
-            ev_ab, lv_ab, ea_ab = ab_pack
-            ab_prior = compute_ab_priors_numpy(
-                ev_ab,
-                lv_ab,
-                ea_ab,
-                bounds_a,
-                bounds_b,
-                accel_pos_thresh=args.ab_accel_pos,
-                accel_neg_thresh=args.ab_accel_neg,
-                rel_speed_max=args.ab_rel_speed_max,
-                vmax_margin=args.ab_vmax_margin,
-                qa=args.ab_q_a,
-                qb=args.ab_q_b,
-                min_scene=args.ab_min_scene,
-            )
-            a_fix = ab_prior["a_stat"]
-            b_fix = ab_prior["b_stat"]
-            delta_stage2 = float(args.delta_fixed) if args.delta_fixed > 0 else 4.0
-
-            v0_prior_lo = psycho_v0_bounds[0]
-            v0_prior_hi = min(
-                psycho_v0_bounds[1],
-                max(vmax_obs * 1.4 + 5.0, median_v + 18.0),
-            )
-            drv_bounds = [psycho_v0_bounds, psycho_s0_bounds, psycho_T_bounds]
-            drv_bounds = list(drv_bounds)
-            drv_bounds[0] = (v0_prior_lo, v0_prior_hi)
-            fit_bounds_note = (
-                str(drv_bounds)
-                + " | fixed a={:.4f} b={:.4f} delta={:.4f}".format(
-                    a_fix, b_fix, delta_stage2
-                )
-            )
+        v0_prior_lo = bounds_joint_v0[0]
+        v0_prior_hi = min(
+            bounds_joint_v0[1],
+            max(vmax_obs * 1.4 + 5.0, median_v + 18.0),
+        )
+        drv_bounds = list(fit_bounds_joint)
+        drv_bounds[0] = (v0_prior_lo, v0_prior_hi)
+        fit_bounds_note = str(drv_bounds)
 
         n_s = len(v_np)
         n_est = max(2000, min(40000, n_s))
@@ -920,43 +602,22 @@ def main():
             seed_local = rng_main.randint(0, 2**31 - 1)
             random.seed(seed_local)
             torch.manual_seed(seed_local)
-            if args.legacy_joint_fit:
-                rmse, tl, pt = _fit_joint_idm_restart(
-                    v_np_sub,
-                    vl_np_sub,
-                    g_np_sub,
-                    a_np_sub,
-                    drv_bounds,
-                    rest_mask.astype(bool),
-                    args.epochs,
-                    args.lr,
-                    delta_joint,
-                    device,
-                )
-                if rmse < global_best_rmse:
-                    global_best_rmse = rmse
-                    global_best_loss = tl
-                    global_best_params = pt
-            else:
-                rmse_u, wloss, pt = _fit_psycho_idm_restart(
-                    v_np_sub,
-                    vl_np_sub,
-                    g_np_sub,
-                    a_np_sub,
-                    drv_bounds,
-                    rest_mask.astype(bool),
-                    args.epochs,
-                    args.lr,
-                    a_fix,
-                    b_fix,
-                    delta_stage2,
-                    device,
-                    loss_weight_accel_scale=args.loss_weight_accel,
-                )
-                if wloss < global_best_loss:
-                    global_best_loss = wloss
-                    global_best_rmse = rmse_u
-                    global_best_params = pt
+            rmse, tl, pt = _fit_joint_idm_restart(
+                v_np_sub,
+                vl_np_sub,
+                g_np_sub,
+                a_np_sub,
+                drv_bounds,
+                rest_mask.astype(bool),
+                args.epochs,
+                args.lr,
+                delta_joint,
+                device,
+            )
+            if rmse < global_best_rmse:
+                global_best_rmse = rmse
+                global_best_loss = tl
+                global_best_params = pt
 
         if global_best_params is None:
             print("[WARN] {} fit failed.".format(d))
@@ -970,29 +631,21 @@ def main():
             loss_mse_approx=global_best_loss,
             parameters=global_best_params,
             fit_bounds_repr=fit_bounds_note,
+            min_sim_time_s=trim_s,
         )
-        if not args.legacy_joint_fit:
-            entry["ab_prior_stage1"] = ab_prior
-            entry["loss_weight_accel"] = float(args.loss_weight_accel)
         aggregate["drivers"].append(entry)
-        row_ext = {}
-        if not args.legacy_joint_fit:
-            row_ext["weighted_loss_mse"] = global_best_loss
-        else:
-            row_ext["weighted_loss_mse"] = ""
         summary_rows.append(
-            dict(
-                driver_id=d,
-                n_samples=len(v_np),
-                rmse_accel=global_best_rmse,
-                v0=global_best_params["v0"],
-                s0=global_best_params["s0"],
-                a=global_best_params["a"],
-                b=global_best_params["b"],
-                T=global_best_params["T"],
-                delta=global_best_params["delta"],
-                **row_ext
-            )
+            {
+                "driver_id": d,
+                "n_samples": len(v_np),
+                "rmse_accel": global_best_rmse,
+                "v0": global_best_params["v0"],
+                "s0": global_best_params["s0"],
+                "a": global_best_params["a"],
+                "b": global_best_params["b"],
+                "T": global_best_params["T"],
+                "delta": global_best_params["delta"],
+            }
         )
 
         drv_dir = os.path.join(args.out_dir, d)
@@ -1000,7 +653,7 @@ def main():
         with open(os.path.join(drv_dir, "idm.json"), "w", encoding="utf-8") as f:
             json.dump(entry, f, indent=2, sort_keys=False)
         print(
-            "{} n={} rmse_accel={:.4f}  v0={:.2f} s0={:.2f} a={:.2f} b={:.2f} T={:.2f} delta={:.2f}{}".format(
+            "{} n={} rmse_accel={:.4f}  v0={:.2f} s0={:.2f} a={:.2f} b={:.2f} T={:.2f} delta={:.2f}".format(
                 d,
                 len(v_np),
                 global_best_rmse,
@@ -1010,7 +663,6 @@ def main():
                 global_best_params["b"],
                 global_best_params["T"],
                 global_best_params["delta"],
-                "" if args.legacy_joint_fit else "  wloss={:.6f}".format(global_best_loss),
             )
         )
 

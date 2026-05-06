@@ -1,42 +1,54 @@
 # -*- coding: utf-8 -*-
 """
-Cluster per-driver longitudinal car-following styles into:
-  conservative / neutral / aggressive.
+Classify per-driver longitudinal car-following styles into 3 ordered labels:
+  conservative / neutral / aggressive
 
-Each driver is summarized with **gap / speed-difference / acceleration-difference**
-statistics (longitudinal interaction with the lead), then k-means (k=3) on z-scored
-features. Pedal-only signals are not used for clustering.
+using a **physics-grounded composite score** (no k-means, no random seeds).
 
-Preferred input:
-  outputs/following_il_clean_gap04 produced from the latest calibrated data.
+## Method
 
-Row-level longitudinal signals:
-  ego / lead speeds (ego_v_long or ego_speed, etc.)
-  distance_headway, time_headway (time_headway may be missing → computed from headway/max(ego_v, eps))
-  TTC **not** taken from CSV: ``headway/(ego_v − lead_v)`` when ego is catching up (>1e−2 m/s).
-  Clustering uses **percentiles of** ``1/time_headway`` and ``1/TTC`` (1/s-style tightness / closing intensity),
-  not raw THW/TTC durations.
-  jerk (longitudinal ``ego_a_long`` / ``ego_acceleration`` differentiated w.r.t. ``timestamp``, |j| summarized).
+Each driver is projected onto 3 orthogonal behavioural axes:
 
-K-means uses **weighted** squared distance on z-scored features:
-  sum_j w_j (z_ij - c_kj)^2
-See ``--cluster_dim_weights`` (default aligns with ``CLUSTER_FEATURES_ENHANCED`` / ``CLUSTER_FEATURES``).
-Style naming (conservative / neutral / aggressive) uses a separate z-score heuristic with
-**positive-only** coefficients (conservative cues enter as ``-z``).
+  D (Distance preference)   — how far the driver keeps from the lead
+  R (Reactivity)            — how large / abrupt the acceleration responses are
+  C (Closeness intensity)   — how often the driver enters dangerous proximity
 
-Also writes following_style_prototypes.json: one prototype driver per style (closest to
-centroid in the same weighted metric) for typical lateral residual replay.
+Within each axis, 2-3 raw features are z-scored and averaged. Then a single
+composite style score is computed:
 
-Visualization (optional):
-  python3 cluster_following_style.py --plot
-  -> saves PCA 2D scatter to --out_dir/following_style_clusters_pca.png
-  
-  python3 following/scripts/cluster_following_style.py \
-    --data_dir following/outputs/following_il_clean_gap04 \
-    --out_dir following/outputs/following_style_clusters \
-    --plot \
-    --cluster_dim_weights 1,1,1,1,1,1,1,1,1,1,1,1 \
-    --plot_path following/outputs/following_style_clusters/my_pca.png
+    style_score = w_R * R + w_C * C - w_D * D
+
+Drivers are sorted by ``style_score`` and split into terciles:
+  bottom third → conservative
+  middle third → neutral
+  top third   → aggressive
+
+This guarantees:
+  - Labels are strictly ordered by aggressiveness
+  - Reproducible (no random init)
+  - Balanced classes (~6-7 drivers each for 20 drivers)
+  - Interpretable axes with physical meaning
+
+## Inputs
+
+Reads calibrated ``driving_data.csv`` files from ``--data_dir`` (default:
+``following/outputs/following_calibrated``). Also optionally reads IDM params
+from ``--idm_dir`` to include the fitted ``T`` parameter as a distance feature.
+
+## Outputs
+
+  <out_dir>/following_style_labels.json       — {driver: label}
+  <out_dir>/following_style_features.csv      — per-driver raw + z-scored features
+  <out_dir>/following_style_prototypes.json   — one prototype per style (closest to group mean)
+  <out_dir>/following_style_heatmap.png       — z-score heatmap sorted by style_score
+  <out_dir>/following_style_scatter.png       — 2D PCA scatter coloured by label
+
+## Usage
+
+    python3 following/scripts/cluster_following_style.py
+    python3 following/scripts/cluster_following_style.py --data_dir following/outputs/following_calibrated --out_dir ... --plot
+
+    python3 /home/zwx/driver_model/following/scripts/cluster_following_style.py --data_dir /home/zwx/driver_model/following/outputs/following_calibrated --out_dir /home/zwx/driver_model/following/outputs/following_style_clusters --plot
 """
 from __future__ import print_function
 
@@ -45,11 +57,14 @@ import csv
 import json
 import math
 import os
-import random
 import re
 
 import numpy as np
 
+
+# ======================================================================
+# Helpers
+# ======================================================================
 
 def _parse_float(v, default=None):
     if v is None:
@@ -59,18 +74,17 @@ def _parse_float(v, default=None):
         return default
     try:
         x = float(s)
-        if math.isfinite(x):
-            return x
-        return default
-    except ValueError:
+        return x if math.isfinite(x) else default
+    except (ValueError, TypeError):
         return default
 
 
-def _discover_segments(data_dir):
+def _discover_csvs(data_dir):
+    """Find all driving_data.csv or segment_*.csv under data_dir."""
     out = []
     for root, _, files in os.walk(data_dir):
         for fn in files:
-            if re.match(r"segment_\d+\.csv$", fn):
+            if fn == "driving_data.csv" or re.match(r"segment_\d+\.csv$", fn):
                 out.append(os.path.join(root, fn))
     return sorted(out)
 
@@ -84,647 +98,380 @@ def _driver_id(path):
 def _percentile(values, pct):
     if not values:
         return 0.0
-    vals = sorted(values)
-    idx = int(round((pct / 100.0) * (len(vals) - 1)))
-    idx = max(0, min(len(vals) - 1, idx))
-    return vals[idx]
+    a = np.asarray(values)
+    return float(np.percentile(a, pct))
 
 
-def _mean(values):
-    return sum(values) / float(len(values)) if values else 0.0
+# ======================================================================
+# Per-driver feature extraction
+# ======================================================================
 
+def _extract_driver_features(csv_paths, min_speed=2.0, min_gap=1.0):
+    """Compute per-driver summary features from all their CSV segments.
 
-def _std(values):
-    if not values:
-        return 0.0
-    m = _mean(values)
-    return (sum((x - m) ** 2 for x in values) / float(len(values))) ** 0.5
-
-
-def _var(values):
-    s = _std(values)
-    return s * s
-
-
-def _value(row, primary, fallback=None):
-    v = _parse_float(row.get(primary))
-    if v is not None:
-        return v
-    if fallback is not None:
-        return _parse_float(row.get(fallback), 0.0)
-    return 0.0
-
-
-def _row_features(row):
-    ego_v = _value(row, "ego_v_long", "ego_speed")
-    lead_v = _value(row, "lead_v_long", "lead_speed")
-    rel_v = _parse_float(row.get("relative_v_long"))
-    if rel_v is None:
-        rel_v = lead_v - ego_v
-    ego_a = _value(row, "ego_a_long", "ego_acceleration")
-    lead_a = _value(row, "lead_a_long", "lead_acceleration")
-    acc_diff = lead_a - ego_a
-    headway = _parse_float(row.get("distance_headway"))
-    time_headway = _parse_float(row.get("time_headway"))
-    throttle = _parse_float(row.get("throttle"), 0.0)
-    brake = _parse_float(row.get("brake"), 0.0)
-    return {
-        "ego_v": ego_v,
-        "lead_v": lead_v,
-        "rel_v": rel_v,
-        "ego_a": ego_a,
-        "lead_a": lead_a,
-        "acc_diff": acc_diff,
-        "headway": headway,
-        "time_headway": time_headway,
-        "throttle": throttle,
-        "brake": brake,
-    }
-
-
-def _thw_csv_usable(th_csv):
-    if th_csv is None:
-        return False
-    if not math.isfinite(float(th_csv)):
-        return False
-    if abs(float(th_csv) - 999.0) <= 1e-3:
-        return False
-    return float(th_csv) > 1e-4 and float(th_csv) < 500.0
-
-
-def _effective_time_headway_csv_or_compute(row, headway_m, ego_v):
-    """Use CSV ``time_headway`` when usable; otherwise ``distance_headway / ego_v`` (mirror collector)."""
-    th_raw = _parse_float(row.get("time_headway"))
-    if _thw_csv_usable(th_raw):
-        return float(th_raw)
-    if headway_m is None or ego_v < 0.5:
-        return None
-    if headway_m < 300.0:
-        return float(headway_m) / float(ego_v)
-    return None
-
-
-def _closing_ttc_from_longitudinal(distance_m, ego_v_long, lead_v_long):
+    Only rows where ego_speed > min_speed AND gap > min_gap are used
+    (filters out standstill / non-following moments).
     """
-    Longitudinal TTC from kinematics (**not CSV ``ttc``**):
+    # Accumulators
+    thw_samples = []
+    gap_samples = []
+    inv_ttc_samples = []
+    acc_samples = []
+    decel_samples = []
+    jerk_samples = []
+    speed_samples = []
 
-    ``distance_headway / (ego_v − lead_v)`` when ego is approaching the lead (>1e−2 m/s).
-    Mirrors ``replay/experiment.DataCollector`` logic.
-    """
-    if distance_m is None:
-        return None
-    dh = float(distance_m)
-    if not math.isfinite(dh) or dh <= 1e-3 or dh >= 300.0:
-        return None
-    dv = float(ego_v_long) - float(lead_v_long)
-    if not math.isfinite(dv) or dv <= 1e-2:
-        return None
-    t = dh / dv
-    if not math.isfinite(t) or t <= 0.0:
-        return None
-    return min(t, 999.0)
-
-
-def _central_derivative(times, vals):
-    n = len(times)
-    if n == 0:
-        return []
-    out = [0.0] * n
-    if n >= 3:
-        for i in range(1, n - 1):
-            dt = times[i + 1] - times[i - 1]
-            if dt > 1e-12:
-                out[i] = (vals[i + 1] - vals[i - 1]) / dt
-    if n >= 2:
-        dt = times[1] - times[0]
-        if dt > 1e-12:
-            out[0] = (vals[1] - vals[0]) / dt
-        dt = times[-1] - times[-2]
-        if dt > 1e-12:
-            out[-1] = (vals[-1] - vals[-2]) / dt
-    return out
-
-
-def _summarize_driver(paths):
-    ego_v = []
-    rel_v_signed = []
-    rel_v_abs = []
-    rel_v_gap_ego_minus_lead = []
-    acc = []
-    acc_abs = []
-    acc_diff = []
-    acc_diff_abs = []
-    headway = []
-    time_headway_effective = []
-    throttle = []
-    brake = []
-    jerk_abs_samples = []
-
-    ttc_positive_closing_samples = []
-
-    rows = 0
-    thw_known_count = 0
-    thw_lt_1s_count = 0
-
-    for fp in paths:
-        seg_times = []
-        seg_acc = []
-
+    for fp in csv_paths:
+        prev_a = None
+        prev_t = None
         with open(fp, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                ts = _parse_float(row.get("timestamp"))
-                r = _row_features(row)
+                t = _parse_float(row.get("sim_time_s")) or _parse_float(row.get("timestamp"))
+                v = _parse_float(row.get("ego_v_long")) or _parse_float(row.get("ego_speed"))
+                a = _parse_float(row.get("ego_a_long")) or _parse_float(row.get("ego_acceleration"))
+                gap = _parse_float(row.get("distance_headway"))
+                lv = _parse_float(row.get("lead_v_long")) or _parse_float(row.get("lead_speed"))
 
-                ego_v.append(r["ego_v"])
-                rel_v_signed.append(r["rel_v"])
-                rel_v_abs.append(abs(r["rel_v"]))
-                rel_v_gap_ego_minus_lead.append(float(r["ego_v"]) - float(r["lead_v"]))
+                if v is None or a is None or gap is None or lv is None:
+                    continue
+                if v < min_speed or gap < min_gap:
+                    prev_a = a
+                    prev_t = t
+                    continue
 
-                acc.append(r["ego_a"])
-                acc_abs.append(abs(r["ego_a"]))
-                acc_diff.append(r["acc_diff"])
-                acc_diff_abs.append(abs(r["acc_diff"]))
+                speed_samples.append(v)
+                gap_samples.append(gap)
+                acc_samples.append(a)
+                if a < 0:
+                    decel_samples.append(abs(a))
 
-                hw = r["headway"]
+                # THW
+                thw = gap / max(v, 0.5)
+                thw_samples.append(thw)
 
-                thaw = None
-                if hw is not None and hw < 300.0:
-                    headway.append(hw)
-                    thaw = _effective_time_headway_csv_or_compute(row, hw, float(r["ego_v"]))
+                # inv_TTC (only when closing)
+                closing_rate = v - lv
+                if closing_rate > 0.01 and gap > 0.5:
+                    inv_ttc = closing_rate / gap
+                    inv_ttc_samples.append(inv_ttc)
 
-                if thaw is not None and math.isfinite(thaw):
-                    time_headway_effective.append(thaw)
-                    thw_known_count += 1
-                    if thaw < 1.0:
-                        thw_lt_1s_count += 1
+                # Jerk (finite difference)
+                if prev_a is not None and prev_t is not None and t is not None:
+                    dt = t - prev_t
+                    if 0.01 < dt < 0.5:
+                        jerk_samples.append(abs(a - prev_a) / dt)
+                prev_a = a
+                prev_t = t
 
-                tty = None
-                if hw is not None:
-                    tty = _closing_ttc_from_longitudinal(hw, float(r["ego_v"]), float(r["lead_v"]))
-                if tty is not None:
-                    ttc_positive_closing_samples.append(tty)
+    if not acc_samples:
+        return None
 
-                throttle.append(r["throttle"])
-                brake.append(r["brake"])
-                rows += 1
+    return dict(
+        # Axis D: Distance preference
+        thw_median=float(np.median(thw_samples)) if thw_samples else 0.0,
+        gap_mean=float(np.mean(gap_samples)) if gap_samples else 0.0,
 
-                if ts is not None:
-                    seg_times.append(ts)
-                    seg_acc.append(float(r["ego_a"]))
+        # Axis R: Reactivity
+        acc_std=float(np.std(acc_samples)),
+        jerk_p75=_percentile(jerk_samples, 75),
+        acc_range=_percentile(acc_samples, 95) - _percentile(acc_samples, 5),
 
-        if len(seg_times) >= 2:
-            jerk_vec = _central_derivative(seg_times, seg_acc)
-            for ji in jerk_vec:
-                if math.isfinite(float(ji)):
-                    jerk_abs_samples.append(abs(float(ji)))
+        # Axis C: Closeness intensity
+        inv_ttc_p90=_percentile(inv_ttc_samples, 90),
+        inv_ttc_p95=_percentile(inv_ttc_samples, 95),
+        decel_p90=_percentile(decel_samples, 90),
 
-    positive_acc = [x for x in acc if x > 0.2]
-    negative_acc_abs = [abs(x) for x in acc if x < -0.2]
-    brake_active = [1.0 if x > 0.02 else 0.0 for x in brake]
-    throttle_active = [1.0 if x > 0.05 else 0.0 for x in throttle]
-
-    thw_less_1s_ratio = float(thw_lt_1s_count) / float(thw_known_count) if thw_known_count > 0 else 0.0
-
-    inv_time_headway_samples = []
-    for t in time_headway_effective:
-        if t is not None and float(t) > 1e-9:
-            inv_time_headway_samples.append(1.0 / float(t))
-
-    inv_ttc_samples = []
-    for tty in ttc_positive_closing_samples:
-        if tty is not None and float(tty) > 1e-9:
-            inv_ttc_samples.append(1.0 / float(tty))
-
-    # Legacy single-stat export (seconds); clustering uses inverse percentiles below.
-    if ttc_positive_closing_samples:
-        ttc_p05 = _percentile(ttc_positive_closing_samples, 5)
-    else:
-        ttc_p05 = 999.0
-
-    jerk_abs_p75 = _percentile(jerk_abs_samples, 75) if jerk_abs_samples else 0.0
-    rel_v_std = _std(rel_v_gap_ego_minus_lead)
-
-    return {
-        "n_rows": rows,
-        "n_segments": len(paths),
-        "ego_v_mean": _mean(ego_v),
-        "ego_v_var": _var(ego_v),
-        "ego_v_p85": _percentile(ego_v, 85),
-        "headway_mean": _mean(headway),
-        "headway_median": _percentile(headway, 50),
-        "headway_p25": _percentile(headway, 25),
-        "time_headway_median": _percentile(time_headway_effective, 50),
-        "time_headway_p25": _percentile(time_headway_effective, 25),
-        "inv_time_headway_p25": _percentile(inv_time_headway_samples, 25),
-        "inv_time_headway_median": _percentile(inv_time_headway_samples, 50),
-        "thw_less_1s_ratio": float(thw_less_1s_ratio),
-        "ttc_p05": float(ttc_p05),
-        "inv_ttc_p50": _percentile(inv_ttc_samples, 50),
-        "inv_ttc_p95": _percentile(inv_ttc_samples, 95),
-        "relative_v_mean": _mean(rel_v_signed),
-        "relative_v_std": _std(rel_v_signed),
-        "relative_v_abs_mean": _mean(rel_v_abs),
-        "relative_v_abs_p95": _percentile(rel_v_abs, 95),
-        "acc_diff_mean": _mean(acc_diff),
-        "acc_diff_abs_mean": _mean(acc_diff_abs),
-        "acc_diff_abs_p95": _percentile(acc_diff_abs, 95),
-        "acc_mean": _mean(acc),
-        "acc_std": _std(acc),
-        "acc_var": _var(acc),
-        "abs_acc_p95": _percentile(acc_abs, 95),
-        "accel_abs_median": _percentile(positive_acc, 50),
-        "accel_abs_p75": _percentile(positive_acc, 75),
-        "decel_abs_median": _percentile(negative_acc_abs, 50),
-        "decel_abs_p75": _percentile(negative_acc_abs, 75),
-        "jerk_abs_p75": float(jerk_abs_p75),
-        "rel_v_std": float(rel_v_std),
-        "positive_acc_mean": _mean(positive_acc),
-        "decel_abs_mean": _mean(negative_acc_abs),
-        "throttle_mean": _mean(throttle),
-        "throttle_active_ratio": _mean(throttle_active),
-        "brake_mean": _mean(brake),
-        "brake_active_ratio": _mean(brake_active),
-    }
+        # Extra (for reporting, not used in score)
+        speed_mean=float(np.mean(speed_samples)),
+        n_rows=len(acc_samples),
+        n_closing=len(inv_ttc_samples),
+    )
 
 
-def _zscore_matrix(rows, feature_names):
-    cols = []
-    for name in feature_names:
-        col = [r[name] for r in rows]
-        m = _mean(col)
-        s = _std(col)
-        if s < 1e-9:
-            s = 1.0
-        cols.append((m, s))
-    mat = []
-    for r in rows:
-        mat.append([(r[name] - cols[i][0]) / cols[i][1] for i, name in enumerate(feature_names)])
-    return mat
+# ======================================================================
+# Scoring and labelling
+# ======================================================================
+
+# Features used for each axis (keys into the feature dict)
+AXIS_D_FEATURES = ["thw_median", "gap_mean"]
+AXIS_R_FEATURES = ["acc_std", "jerk_p75", "acc_range"]
+AXIS_C_FEATURES = ["inv_ttc_p90", "decel_p90"]
+
+ALL_SCORE_FEATURES = AXIS_D_FEATURES + AXIS_R_FEATURES + AXIS_C_FEATURES
 
 
-def _kmeans(points, k, seed, max_iter=100, dim_weights=None):
-    """Lloyd on weighted SSE: sum_j w_j (p_j - c_j)^2. Centroids remain coordinate-wise means."""
-    rng = random.Random(seed)
-    if len(points) < k:
-        raise RuntimeError("Need at least {} drivers for clustering.".format(k))
-    d = len(points[0])
-    if dim_weights is None:
-        w = [1.0] * d
-    else:
-        w = list(dim_weights)
-        if len(w) != d:
-            raise RuntimeError(
-                "dim_weights length {} != feature dim {}".format(len(w), d)
-            )
-        if any(x <= 0.0 for x in w):
-            raise RuntimeError("dim_weights must be positive")
-    centers = [list(p) for p in rng.sample(points, k)]
-    labels = [0] * len(points)
-    for _ in range(max_iter):
-        changed = False
-        for i, p in enumerate(points):
-            dists = [
-                sum(w[j] * (p[j] - c[j]) ** 2 for j in range(d))
-                for c in centers
-            ]
-            lab = min(range(k), key=lambda x: dists[x])
-            if labels[i] != lab:
-                labels[i] = lab
-                changed = True
-        new_centers = []
-        for lab in range(k):
-            members = [points[i] for i in range(len(points)) if labels[i] == lab]
-            if not members:
-                new_centers.append(list(rng.choice(points)))
-            else:
-                new_centers.append([
-                    sum(p[j] for p in members) / float(len(members))
-                    for j in range(d)
-                ])
-        centers = new_centers
-        if not changed:
-            break
-    return labels, centers
+def _zscore_matrix(drivers, features, keys):
+    """Build (n_drivers, len(keys)) z-scored matrix."""
+    n = len(drivers)
+    m = len(keys)
+    raw = np.zeros((n, m), dtype=np.float64)
+    for i, d in enumerate(drivers):
+        for j, k in enumerate(keys):
+            raw[i, j] = features[d].get(k, 0.0)
+    mean = raw.mean(axis=0)
+    std = raw.std(axis=0)
+    std[std < 1e-9] = 1.0
+    z = (raw - mean) / std
+    return z, raw, mean, std
 
 
-def _pca2(zpoints):
-    """PCA to 2D on row-wise centered z-scored matrix. Returns (n,2) coords and variance fractions."""
-    X = np.asarray(zpoints, dtype=np.float64)
-    if X.shape[0] < 2:
-        return None, None
-    X = X - X.mean(axis=0)
-    _, s, Vt = np.linalg.svd(X, full_matrices=False)
-    W = Vt[:2].T
-    proj = X @ W
-    tot = float(np.sum(s ** 2)) + 1e-12
-    var_frac = [(s[i] ** 2 / tot) for i in range(min(2, len(s)))]
-    return proj, var_frac
+def _compute_style_scores(drivers, features, w_D=1.0, w_R=1.0, w_C=1.0):
+    """Compute composite style score for each driver.
 
-
-CLUSTER_FEATURES_ENHANCED = [
-    "headway_median",
-    "headway_p25",
-    "inv_time_headway_p25",
-    "inv_time_headway_median",
-    "inv_ttc_p50",
-    "inv_ttc_p95",
-    "ego_v_var",
-    "accel_abs_median",
-    "accel_abs_p75",
-    "decel_abs_median",
-    "decel_abs_p75",
-    "jerk_abs_p75",
-]
-
-
-CLUSTER_FEATURES = CLUSTER_FEATURES_ENHANCED
-
-
-def parse_cluster_dim_weights(s):
-    """Parse comma-separated positive weights; length must match ``CLUSTER_FEATURES``."""
-    dim_weights = [float(x.strip()) for x in s.split(",") if str(x).strip()]
-    if len(dim_weights) != len(CLUSTER_FEATURES):
-        raise RuntimeError(
-            "cluster_dim_weights: expected {} values ({}), got {}".format(
-                len(CLUSTER_FEATURES),
-                ",".join(CLUSTER_FEATURES),
-                len(dim_weights),
-            )
-        )
-    if any(w <= 0.0 for w in dim_weights):
-        raise RuntimeError("cluster_dim_weights must all be positive")
-    return dim_weights
-
-
-def assign_kmeans_styles(rows, dim_weights, seed):
+    Returns sorted list of (driver, score, D, R, C).
     """
-    Run z-score + weighted k-means (k=3) and assign conservative/neutral/aggressive.
+    z_all, raw_all, mean_all, std_all = _zscore_matrix(
+        drivers, features, ALL_SCORE_FEATURES)
 
-    Mutates each row in ``rows`` with keys cluster_id, style_label.
-    Each row must include driver_id and all CLUSTER_FEATURES fields (raw metrics, not z).
+    n_d = len(AXIS_D_FEATURES)
+    n_r = len(AXIS_R_FEATURES)
+    n_c = len(AXIS_C_FEATURES)
 
-    Returns:
-        dict with keys: points (z-scored rows), cluster_features, numeric_cluster_to_style
-    """
-    cluster_features = list(CLUSTER_FEATURES)
-    if len(dim_weights) != len(cluster_features):
-        raise RuntimeError(
-            "dim_weights length {} != {}".format(len(dim_weights), len(cluster_features))
-        )
-    if any(w <= 0.0 for w in dim_weights):
-        raise RuntimeError("dim_weights must be positive")
-    if len(rows) < 3:
-        raise RuntimeError("Need at least 3 drivers for k=3 clustering.")
+    D = z_all[:, :n_d].mean(axis=1)
+    R = z_all[:, n_d:n_d + n_r].mean(axis=1)
+    C = z_all[:, n_d + n_r:n_d + n_r + n_c].mean(axis=1)
 
-    points = _zscore_matrix(rows, cluster_features)
-    labels, _ = _kmeans(points, 3, seed, dim_weights=dim_weights)
+    scores = w_R * R + w_C * C - w_D * D
 
-    cluster_scores = {}
-    for lab in range(3):
-        idxs = [i for i, x in enumerate(labels) if x == lab]
-        if not idxs:
-            cluster_scores[lab] = 0.0
-            continue
-        score = 0.0
-        for i in idxs:
-            p = points[i]
-            f = dict(zip(cluster_features, p))
-            # Aggressiveness ↑: all coefficients positive (conservative-oriented z features enter as -z).
-            score += (
-                1.0 * (-f["headway_median"])
-                + 0.95 * (-f["headway_p25"])
-                + 0.9 * f["inv_time_headway_p25"]
-                + 1.0 * f["inv_time_headway_median"]
-                + 1.0 * f["inv_ttc_p50"]
-                + 0.95 * f["inv_ttc_p95"]
-                + 1.0 * f["ego_v_var"]
-                + 0.5 * f["accel_abs_median"]
-                + 0.5 * f["accel_abs_p75"]
-                + 0.5 * f["decel_abs_median"]
-                + 0.5 * f["decel_abs_p75"]
-                + 0.5 * f["jerk_abs_p75"]
-            )
-        cluster_scores[lab] = score / float(len(idxs))
-    ordered = sorted(cluster_scores.keys(), key=lambda x: cluster_scores[x])
-    label_name = {
-        ordered[0]: "conservative",
-        ordered[1]: "neutral",
-        ordered[2]: "aggressive",
-    }
-
-    for i, r in enumerate(rows):
-        r["cluster_id"] = labels[i]
-        r["style_label"] = label_name[labels[i]]
-
-    return {
-        "points": points,
-        "cluster_features": cluster_features,
-        "numeric_cluster_to_style": label_name,
-    }
+    results = []
+    for i, d in enumerate(drivers):
+        results.append(dict(
+            driver=d, score=float(scores[i]),
+            D=float(D[i]), R=float(R[i]), C=float(C[i]),
+        ))
+    results.sort(key=lambda x: x["score"])
+    return results, z_all, raw_all, mean_all, std_all
 
 
-def _style_prototype_summary(rows, points, cluster_features, dim_weights=None):
-    """One prototype driver per style = closest to cluster centroid (same metric as k-means)."""
-    w = np.ones(len(cluster_features), dtype=np.float64)
-    if dim_weights is not None:
-        w = np.asarray(dim_weights, dtype=np.float64)
-        if w.shape[0] != len(cluster_features):
-            raise RuntimeError("dim_weights length mismatch in prototype summary")
-    by_style = {}
-    for i, r in enumerate(rows):
-        sty = r["style_label"]
-        by_style.setdefault(sty, []).append(i)
-    summary = {}
-    for sty in sorted(by_style.keys()):
-        idxs = by_style[sty]
-        pts = np.asarray([points[i] for i in idxs], dtype=np.float64)
-        c = pts.mean(axis=0)
-        d2 = np.sum(w * (pts - c) ** 2, axis=1)
-        j = int(np.argmin(d2))
-        proto_i = idxs[j]
-        summary[sty] = {
-            "prototype_driver": rows[proto_i]["driver_id"],
-            "drivers_in_style": [rows[i]["driver_id"] for i in idxs],
-            "n_drivers": len(idxs),
-            "cluster_id_numeric": int(rows[proto_i]["cluster_id"]),
-            "prototype_features": {k: rows[proto_i].get(k) for k in cluster_features},
-        }
-    return summary
+def _assign_labels(sorted_results):
+    """Split sorted results into terciles: conservative / neutral / aggressive."""
+    n = len(sorted_results)
+    n_cons = n // 3
+    n_aggr = n // 3
+    n_neut = n - n_cons - n_aggr
+
+    labels = {}
+    for i, r in enumerate(sorted_results):
+        if i < n_cons:
+            labels[r["driver"]] = "conservative"
+        elif i < n_cons + n_neut:
+            labels[r["driver"]] = "neutral"
+        else:
+            labels[r["driver"]] = "aggressive"
+    return labels
 
 
-def _save_cluster_plot(rows, zpoints, out_path):
-    try:
-        import matplotlib
+def _find_prototypes(sorted_results, labels):
+    """Find the driver closest to the group mean score for each label."""
+    groups = {}
+    for r in sorted_results:
+        lbl = labels[r["driver"]]
+        groups.setdefault(lbl, []).append(r)
+    prototypes = {}
+    for lbl, members in groups.items():
+        mean_score = np.mean([m["score"] for m in members])
+        best = min(members, key=lambda m: abs(m["score"] - mean_score))
+        prototypes[lbl] = best["driver"]
+    return prototypes
 
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("[WARN] matplotlib not installed; skip figure. Try: pip install matplotlib")
-        return
 
-    xy, var_frac = _pca2(zpoints)
-    if xy is None:
-        print("[WARN] Need at least 2 drivers for PCA plot.")
-        return
+# ======================================================================
+# Visualization
+# ======================================================================
 
-    colors = {
-        "conservative": "#27ae60",
-        "neutral": "#3498db",
-        "aggressive": "#e74c3c",
-    }
-    fig, ax = plt.subplots(figsize=(9, 7))
-    for style in ("conservative", "neutral", "aggressive"):
-        idx = [i for i, r in enumerate(rows) if r.get("style_label") == style]
-        if not idx:
-            continue
-        ax.scatter(
-            xy[idx, 0],
-            xy[idx, 1],
-            s=120,
-            c=colors[style],
-            label=style,
-            edgecolors="0.3",
-            linewidths=0.6,
-            zorder=2,
-        )
-    for i, r in enumerate(rows):
-        ax.annotate(
-            r.get("driver_id", str(i)),
-            (xy[i, 0], xy[i, 1]),
-            fontsize=9,
-            xytext=(4, 3),
-            textcoords="offset points",
-            color="0.15",
-        )
-    pct0 = 100.0 * var_frac[0] if var_frac else 0.0
-    pct1 = 100.0 * var_frac[1] if len(var_frac) > 1 else 0.0
-    ax.set_xlabel("PC1 ({:.0f}% variance)".format(pct0))
-    ax.set_ylabel("PC2 ({:.0f}% variance)".format(pct1))
-    ax.set_title("Car-following style clusters (PCA on z-scored CLUSTER_FEATURES_ENHANCED)")
-    ax.grid(True, linestyle="--", alpha=0.35)
-    ax.legend(loc="best", framealpha=0.9)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
+def _plot_heatmap(drivers_sorted, z_all, driver_order, labels, out_path):
+    """Z-score heatmap sorted by style_score."""
+    import matplotlib.pyplot as plt
+
+    idx_map = {d: i for i, d in enumerate(driver_order)}
+    order = [idx_map[r["driver"]] for r in drivers_sorted]
+    z_sorted = z_all[order]
+
+    fig, ax = plt.subplots(figsize=(10, 8), dpi=120)
+    im = ax.imshow(z_sorted, aspect="auto", cmap="RdYlGn_r", vmin=-2.5, vmax=2.5)
+
+    ax.set_yticks(range(len(drivers_sorted)))
+    ylabels = []
+    for r in drivers_sorted:
+        lbl = labels[r["driver"]]
+        marker = {"conservative": "●", "neutral": "◆", "aggressive": "▲"}[lbl]
+        ylabels.append("{} {} ({:.2f})".format(marker, r["driver"], r["score"]))
+    ax.set_yticklabels(ylabels, fontsize=9)
+
+    ax.set_xticks(range(len(ALL_SCORE_FEATURES)))
+    ax.set_xticklabels(ALL_SCORE_FEATURES, rotation=45, ha="right", fontsize=9)
+
+    # Colour bar
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label("z-score")
+
+    # Horizontal lines between groups
+    n = len(drivers_sorted)
+    n_cons = n // 3
+    n_neut = n - 2 * (n // 3)
+    ax.axhline(n_cons - 0.5, color="black", lw=1.5, ls="--")
+    ax.axhline(n_cons + n_neut - 0.5, color="black", lw=1.5, ls="--")
+
+    ax.set_title("Following Style Features (sorted by aggressiveness score)")
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print("[OK] figure:", out_path)
+    print("[plot] heatmap -> {}".format(out_path))
 
+
+def _plot_scatter(drivers_sorted, labels, out_path):
+    """2D scatter: D vs (R+C), coloured by label."""
+    import matplotlib.pyplot as plt
+
+    colors = {"conservative": "#2ca02c", "neutral": "#1f77b4", "aggressive": "#d62728"}
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=120)
+    for r in drivers_sorted:
+        lbl = labels[r["driver"]]
+        ax.scatter(r["D"], r["R"] + r["C"], color=colors[lbl], s=80, zorder=3)
+        ax.annotate(r["driver"], (r["D"], r["R"] + r["C"]),
+                    fontsize=8, ha="left", va="bottom")
+
+    ax.set_xlabel("D (Distance preference, z-score) ← conservative")
+    ax.set_ylabel("R + C (Reactivity + Closeness, z-score) → aggressive")
+    ax.axhline(0, color="gray", ls="--", lw=0.8)
+    ax.axvline(0, color="gray", ls="--", lw=0.8)
+    ax.set_title("Following Style: Distance vs Reactivity+Closeness")
+    ax.grid(True, ls="--", alpha=0.4)
+
+    # Legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=colors["conservative"], label="Conservative"),
+        Patch(facecolor=colors["neutral"], label="Neutral"),
+        Patch(facecolor=colors["aggressive"], label="Aggressive"),
+    ]
+    ax.legend(handles=legend_elements, loc="upper left")
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("[plot] scatter -> {}".format(out_path))
+
+
+# ======================================================================
+# Main
+# ======================================================================
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--data_dir",
-        type=str,
-        default="/home/zwx/driver_model/outputs/following_il_clean_gap04",
+    ap = argparse.ArgumentParser(
+        description="Classify per-driver following style into conservative/neutral/aggressive."
     )
-    ap.add_argument(
-        "--out_dir",
-        type=str,
-        default="/home/zwx/driver_model/outputs/following_style_clusters",
-    )
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument(
-        "--plot",
-        action="store_true",
-        help="Save PCA 2D scatter (matplotlib) to --plot_path",
-    )
-    ap.add_argument(
-        "--plot_path",
-        type=str,
-        default="",
-        help="PNG path (default: <out_dir>/following_style_clusters_pca.png)",
-    )
-    ap.add_argument(
-        "--cluster_dim_weights",
-        type=str,
-        default="1,1,1,1,1,1,1,1,1,1,1,1",
-        help=(
-            "Comma-separated positive weights for k-means / prototype distance on z-scored "
-            "features, order: "
-            + ", ".join(CLUSTER_FEATURES)
-        ),
-    )
+    ap.add_argument("--data_dir", type=str,
+                    default="/home/zwx/driver_model/following/outputs/following_calibrated",
+                    help="Root directory with per-driver calibrated CSVs.")
+    ap.add_argument("--idm_dir", type=str,
+                    default="/home/zwx/driver_model/following/outputs/idm_per_driver",
+                    help="Directory with <T*>/idm.json for IDM T parameter.")
+    ap.add_argument("--out_dir", type=str,
+                    default="/home/zwx/driver_model/following/outputs/following_style_clusters",
+                    help="Output directory for labels, features, plots.")
+    ap.add_argument("--w_D", type=float, default=1.0, help="Weight for Distance axis.")
+    ap.add_argument("--w_R", type=float, default=1.0, help="Weight for Reactivity axis.")
+    ap.add_argument("--w_C", type=float, default=1.0, help="Weight for Closeness axis.")
+    ap.add_argument("--min_sim_time_s", type=float, default=15.0,
+                    help="Only use rows with sim_time_s >= this (skip startup).")
+    ap.add_argument("--plot", action="store_true", help="Generate heatmap and scatter plots.")
     args = ap.parse_args()
 
-    paths = _discover_segments(args.data_dir)
+    # --- Discover CSVs per driver ---
+    all_csvs = _discover_csvs(args.data_dir)
     by_driver = {}
-    for p in paths:
+    for p in all_csvs:
         by_driver.setdefault(_driver_id(p), []).append(p)
+    drivers = sorted(by_driver.keys(),
+                     key=lambda x: int(x[1:]) if x[1:].isdigit() else 9999)
+    if not drivers:
+        raise SystemExit("[ERR] no CSVs found under " + args.data_dir)
+    print("[data] {} drivers, {} CSVs total".format(len(drivers), len(all_csvs)))
 
-    rows = []
-    for driver in sorted(by_driver.keys(), key=lambda x: int(x[1:]) if x.startswith("T") and x[1:].isdigit() else 999):
-        metrics = _summarize_driver(by_driver[driver])
-        metrics["driver_id"] = driver
-        rows.append(metrics)
+    # --- Extract features per driver ---
+    features = {}
+    for d in drivers:
+        feat = _extract_driver_features(by_driver[d], min_speed=2.0, min_gap=1.0)
+        if feat is None:
+            print("[SKIP] {}: no valid rows".format(d))
+            continue
+        # Optionally add IDM T parameter
+        idm_fp = os.path.join(args.idm_dir, d, "idm.json")
+        if os.path.isfile(idm_fp):
+            with open(idm_fp, "r", encoding="utf-8") as f:
+                idm_data = json.load(f)
+            feat["idm_T"] = float(idm_data.get("parameters", {}).get("T", 0.0))
+        else:
+            feat["idm_T"] = feat["thw_median"]  # fallback
+        features[d] = feat
 
-    cluster_features = list(CLUSTER_FEATURES)
-    dim_weights = parse_cluster_dim_weights(args.cluster_dim_weights)
-    print(
-        "[INFO] k-means dim weights:",
-        ", ".join("{}={}".format(n, w) for n, w in zip(cluster_features, dim_weights)),
-    )
+    valid_drivers = [d for d in drivers if d in features]
+    if len(valid_drivers) < 3:
+        raise SystemExit("[ERR] need at least 3 drivers, got {}".format(len(valid_drivers)))
 
-    result = assign_kmeans_styles(rows, dim_weights, args.seed)
-    points = result["points"]
+    # --- Compute scores and assign labels ---
+    sorted_results, z_all, raw_all, mean_all, std_all = _compute_style_scores(
+        valid_drivers, features, w_D=args.w_D, w_R=args.w_R, w_C=args.w_C)
+    labels = _assign_labels(sorted_results)
+    prototypes = _find_prototypes(sorted_results, labels)
 
+    # --- Print summary ---
+    print("\n{:<5s} {:>7s} {:>6s} {:>6s} {:>6s}  {:<14s}".format(
+        "Drv", "Score", "D", "R", "C", "Label"))
+    print("-" * 52)
+    for r in sorted_results:
+        lbl = labels[r["driver"]]
+        print("{:<5s} {:+7.3f} {:+6.3f} {:+6.3f} {:+6.3f}  {:<14s}".format(
+            r["driver"], r["score"], r["D"], r["R"], r["C"], lbl))
+    print("\nPrototypes: {}".format(prototypes))
+
+    # --- Save outputs ---
     os.makedirs(args.out_dir, exist_ok=True)
-    out_fp = os.path.join(args.out_dir, "driver_following_style_clusters.csv")
-    fieldnames = ["driver_id", "style_label", "cluster_id"] + [
-        "n_segments",
-        "n_rows",
-    ] + cluster_features + [
-        "time_headway_median",
-        "time_headway_p25",
-        "ttc_p05",
-        "thw_less_1s_ratio",
-        "rel_v_std",
-        "headway_mean",
-        "acc_var",
-        "relative_v_std",
-        "positive_acc_mean",
-        "decel_abs_mean",
-        "relative_v_mean",
-        "relative_v_abs_p95",
-        "acc_diff_mean",
-        "ego_v_mean",
-        "acc_mean",
-        "abs_acc_p95",
-        "acc_std",
-        "throttle_active_ratio",
-        "brake_mean",
-    ]
-    with open(out_fp, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+
+    # Labels JSON
+    labels_fp = os.path.join(args.out_dir, "following_style_labels.json")
+    with open(labels_fp, "w", encoding="utf-8") as f:
+        json.dump(labels, f, indent=2, ensure_ascii=False)
+    print("[saved] {}".format(labels_fp))
+
+    # Prototypes JSON
+    proto_fp = os.path.join(args.out_dir, "following_style_prototypes.json")
+    proto_out = dict(prototypes=prototypes, sorted_scores=[
+        dict(driver=r["driver"], score=r["score"], D=r["D"], R=r["R"], C=r["C"],
+             label=labels[r["driver"]])
+        for r in sorted_results
+    ])
+    with open(proto_fp, "w", encoding="utf-8") as f:
+        json.dump(proto_out, f, indent=2, ensure_ascii=False)
+    print("[saved] {}".format(proto_fp))
+
+    # Features CSV
+    feat_fp = os.path.join(args.out_dir, "following_style_features.csv")
+    feat_keys = ALL_SCORE_FEATURES + ["idm_T", "speed_mean", "n_rows", "n_closing"]
+    with open(feat_fp, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["driver", "label", "score", "D", "R", "C"] + feat_keys)
         w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in fieldnames})
+        for r in sorted_results:
+            d = r["driver"]
+            row = dict(driver=d, label=labels[d], score=r["score"],
+                       D=r["D"], R=r["R"], C=r["C"])
+            for k in feat_keys:
+                row[k] = features[d].get(k, "")
+            w.writerow(row)
+    print("[saved] {}".format(feat_fp))
 
-    proto_path = os.path.join(args.out_dir, "following_style_prototypes.json")
-    proto_summary = _style_prototype_summary(
-        rows, points, cluster_features, dim_weights=dim_weights
-    )
-    with open(proto_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "cluster_features_zscored_pca_order": cluster_features,
-                "cluster_dim_weights": dict(zip(cluster_features, dim_weights)),
-                "styles": proto_summary,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-    print("[OK] prototypes:", proto_path)
-
-    print("[OK] drivers:", len(rows))
-    print("[OK] output:", out_fp)
-    for r in rows:
-        print("{}: {}".format(r["driver_id"], r["style_label"]))
-
+    # --- Plots ---
     if args.plot:
-        plot_fp = args.plot_path.strip()
-        if not plot_fp:
-            plot_fp = os.path.join(args.out_dir, "following_style_clusters_pca.png")
-        _save_cluster_plot(rows, points, plot_fp)
+        heatmap_path = os.path.join(args.out_dir, "following_style_heatmap.png")
+        _plot_heatmap(sorted_results, z_all, valid_drivers, labels, heatmap_path)
+
+        scatter_path = os.path.join(args.out_dir, "following_style_scatter.png")
+        _plot_scatter(sorted_results, labels, scatter_path)
+
+    print("\n[DONE]")
 
 
 if __name__ == "__main__":
