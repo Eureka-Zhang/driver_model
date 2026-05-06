@@ -18,9 +18,9 @@ def main() -> None:
     profiles = {
         "T2": "Conservative (T2)",
         "T10": "Neutral (T10)",
-        "T12": "Aggressive (T12)",
+        "T11": "Aggressive (T11)",
     }
-    colors = {"T2": "#1f77b4", "T10": "#2ca02c", "T12": "#d62728"}
+    colors = {"T2": "#1f77b4", "T10": "#2ca02c", "T11": "#d62728"}
 
     series = {}
     for driver, label in profiles.items():
@@ -78,7 +78,7 @@ def main() -> None:
 
     fig.tight_layout()
     out = Path(
-        "/home/zwx/driver_model/following/outputs/pictures/residual_gru_takeover_20s/typical_style_comparison_T2_T10_T12_post20s.png"
+        "/home/zwx/driver_model/following/outputs/pictures/residual_gru_takeover_20s/typical_style_comparison_T2_T10_T11_post20s.png"
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=180)
