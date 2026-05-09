@@ -35,8 +35,8 @@ Discovery: ``exp[123]_o``, exclude ``pre_familiarization`` / ``_b``.
 Example::
 
   python3 overtaking/scripts/segment_overtaking_phases.py \
-    --data_dir overtaking/outputs/p1p3_lateral_all \
-    --out_dir overtaking/outputs/overtaking_phase_segments_all_p1p3 \
+    --data_dir overtaking/outputs/overtaking_p4_return_fix \
+    --out_dir overtaking/outputs/overtaking_phase_segments_p4_return_fix \
     --right_y_min -9.30 --right_y_max -5.75 --p2_end_mode fixed --y_center_p2_end -4.6 --ego_half_width_m 0.9 \
     --segment_smooth_window 5 --edge_eps_m 0.08 --center_hold_sec 0.15 \
     --write_segment_csv \

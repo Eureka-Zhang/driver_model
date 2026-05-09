@@ -16,11 +16,11 @@ import matplotlib.pyplot as plt
 def main() -> None:
     base = Path("/home/zwx/driver_model/following/outputs/residual_gru_takeover_20s")
     profiles = {
-        "T2": "Conservative (T2)",
-        "T10": "Neutral (T10)",
-        "T11": "Aggressive (T11)",
+        "T20": "Conservative (T20)",
+        "T4": "Neutral (T4)",
+        "T12": "Aggressive (T12)",
     }
-    colors = {"T2": "#1f77b4", "T10": "#2ca02c", "T11": "#d62728"}
+    colors = {"T20": "#1f77b4", "T4": "#2ca02c", "T12": "#d62728"}
 
     series = {}
     for driver, label in profiles.items():
