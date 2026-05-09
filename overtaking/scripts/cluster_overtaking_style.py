@@ -9,12 +9,28 @@ Each **maneuver** is either a single ``segment_<n>.csv`` (IL 整段) or a **merg
 脚本会 **按前车速度实验拆分**，在 ``--out_dir`` 下分别生成 ``exp1/`` ``exp2/`` ``exp3/`` 三套聚类结果；
 无前述标记时仍为单次全量聚类。
 
+默认 **风格标签**（conservative / neutral / aggressive）按每名司机在 z 特征上的 **攻击性代理分数** 排序后做 **三分位** 切分（人数近似三等分，与跟车脚本一致），避免 k-means 某一簇过大（例如 aggressive 过多）。k-means 仍用于 ``cluster_id`` 与特征结构；若要坚持「簇均值命名」、接受簇大小不均，可加 ``--style_labels kmeans``。
+
+每种风格会选出 **典型司机**：在 z 分数特征空间（与 k-means 相同维权重）下，按到该 **风格组内** 均值的加权平方距离升序排名；``prototype_driver`` 为第 1 名。
+结果见 ``overtaking_style_prototypes.json``（含 ``typicality_ranking``）与 ``overtaking_style_typical_drivers.csv``。
+
 Example::
 
-  python3 overtaking/scripts/cluster_overtaking_style.py \
-    --data_dir overtaking/outputs/overtaking_phase_segments_selected \
-    --out_dir overtaking/outputs/overtaking_style_clusters_selected \
-    --plot --seed 42
+python3 overtaking/scripts/cluster_overtaking_style.py \
+  --data_dir overtaking/outputs/overtaking_phase_segments_all_p1p3 \
+  --out_dir overtaking/outputs/overtaking_style_merged \
+  --no_split_by_experiment \
+  --plot
+
+With ``--plot``, also writes (per bundle folder): ``overtaking_style_clusters_pca.png``,
+``overtaking_style_heatmap.png``, ``overtaking_style_scatter_raw_pairs.png``,
+``overtaking_style_raw_pairs_unlabeled.png``.
+
+Regenerate only the unlabeled raw-pairs PNG from an existing run::
+
+  python3 overtaking/scripts/cluster_overtaking_style.py \\
+    --plot_raw_unlabeled_only --out_dir overtaking/outputs/.../exp1
+
 """
 from __future__ import print_function
 
@@ -26,6 +42,8 @@ import json
 import math
 import os
 import re
+
+import numpy as np
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", ".."))
@@ -44,11 +62,14 @@ _cfs = _load_module("cluster_following_style", _CFS_PATH)
 _sop = _load_module("segment_overtaking_phases", _SOP_PATH)
 
 _parse_float = _cfs._parse_float
-_mean = _cfs._mean
 _percentile = _cfs._percentile
-_zscore_matrix = _cfs._zscore_matrix
-_kmeans = _cfs._kmeans
-_pca2 = _cfs._pca2
+
+
+def _mean(vals):
+    """Arithmetic mean; empty list -> 0.0 (matches prior overtaking helper contract)."""
+    if not vals:
+        return 0.0
+    return float(sum(vals)) / float(len(vals))
 
 # english key, 说明, 风格关联预期
 CLUSTER_FEATURE_ROWS = (
@@ -65,6 +86,320 @@ CLUSTER_FEATURE_ROWS = (
 )
 
 CLUSTER_FEATURES = [r[0] for r in CLUSTER_FEATURE_ROWS]
+
+# Raw-feature scatter panels (2x2), same spirit as cluster_following_style raw_pairs
+OVERTAKING_RAW_PAIR_SPECS = (
+    (
+        ("ttc_init", "dist_init"),
+        "TTC init (s)",
+        "Dist init (m)",
+        "Start of LC: spacing",
+    ),
+    (
+        ("a_lat_max", "jerk_lat_max"),
+        "a_lat max (m/s²)",
+        "jerk_lat max (m/s³)",
+        "Lateral dynamics",
+    ),
+    (
+        ("v_diff_pass", "t_duration"),
+        "v diff pass (m/s)",
+        "Duration (s)",
+        "Pass timing",
+    ),
+    (
+        ("ttc_init", "t_duration"),
+        "TTC init (s)",
+        "Duration (s)",
+        "TTC vs duration",
+    ),
+)
+
+_STYLE_COLORS = {
+    "conservative": "#2ca02c",
+    "neutral": "#1f77b4",
+    "aggressive": "#d62728",
+}
+_STYLE_FALLBACK = "#7f7f7f"
+
+
+def _zscore_feature_matrix(rows, keys):
+    """Z-score columns from list-of-dict rows; returns (n, len(keys)) array."""
+    n = len(rows)
+    m = len(keys)
+    raw = np.zeros((n, m), dtype=np.float64)
+    for i, r in enumerate(rows):
+        for j, k in enumerate(keys):
+            v = r.get(k)
+            if v is None or v == "":
+                raw[i, j] = np.nan
+            else:
+                raw[i, j] = float(v)
+    mean = np.nanmean(raw, axis=0)
+    std = np.nanstd(raw, axis=0)
+    std[std < 1e-9] = 1.0
+    z = (raw - mean) / std
+    z = np.nan_to_num(z, nan=0.0)
+    return z
+
+
+def _kmeans_weighted(X, k, seed, dim_weights=None, max_iter=100):
+    """k-means on rows of X with per-dimension weights (same convention as legacy script)."""
+    rng = np.random.RandomState(int(seed) % (2**32))
+    n, d = X.shape
+    w = np.ones(d, dtype=np.float64)
+    if dim_weights is not None:
+        w = np.asarray(dim_weights, dtype=np.float64)
+    Xw = X * np.sqrt(w)
+
+    cent = np.zeros((k, d), dtype=np.float64)
+    cent[0] = Xw[rng.randint(n)]
+    for ki in range(1, k):
+        dist2 = np.min(np.sum((Xw[:, None, :] - cent[:ki]) ** 2, axis=2), axis=1)
+        dist2 = np.maximum(dist2, 0.0)
+        s = dist2.sum()
+        if s < 1e-18:
+            j = rng.randint(n)
+        else:
+            j = rng.choice(n, p=dist2 / s)
+        cent[ki] = Xw[j]
+
+    labels = np.zeros(n, dtype=np.int32)
+    for _ in range(max_iter):
+        d2 = np.sum((Xw[:, None, :] - cent[None, :, :]) ** 2, axis=2)
+        new_labels = np.argmin(d2, axis=1).astype(np.int32)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        for kk in range(k):
+            mask = labels == kk
+            if np.any(mask):
+                cent[kk] = Xw[mask].mean(axis=0)
+            else:
+                cent[kk] = Xw[rng.randint(n)]
+    return labels, cent
+
+
+def _pca2_xy(X):
+    """First two PCs of row-centered X; returns xy (n,2), variance_fraction (2,)."""
+    X = np.asarray(X, dtype=np.float64)
+    n, d = X.shape
+    if n < 2:
+        return None, (0.0, 0.0)
+    Xc = X - X.mean(axis=0)
+    U, s, Vt = np.linalg.svd(Xc, full_matrices=False)
+    xy = U[:, :2] * s[:2]
+    var = (s ** 2) / max(n - 1, 1)
+    vf = var / (var.sum() + 1e-12)
+    return xy, vf[:2]
+
+
+def _plot_row_float(row, key):
+    v = row.get(key, "")
+    if v is None or v == "":
+        return float("nan")
+    if isinstance(v, (int, float)):
+        x = float(v)
+        return x if math.isfinite(x) else float("nan")
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else float("nan")
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _style_color(label):
+    s = str(label or "").strip()
+    if s in _STYLE_COLORS:
+        return _STYLE_COLORS[s]
+    if s.startswith("tier_"):
+        return "#9467bd"
+    return _STYLE_FALLBACK
+
+
+def _scatter_panel_style(ax, xs, ys, driver_ids, colors, xlabel, ylabel, title):
+    xv = np.asarray(xs, dtype=np.float64)
+    yv = np.asarray(ys, dtype=np.float64)
+    mask = np.isfinite(xv) & np.isfinite(yv)
+    if not np.any(mask):
+        ax.text(0.5, 0.5, "no finite data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+    xv = xv[mask]
+    yv = yv[mask]
+    dv = [driver_ids[i] for i, m in enumerate(mask) if m]
+    cv = [colors[i] for i, m in enumerate(mask) if m]
+    ax.scatter(xv, yv, c=cv, s=72, alpha=0.85, edgecolors="white", linewidths=0.6, zorder=3)
+    for xi, yi, di in zip(xv, yv, dv):
+        ax.annotate(str(di), (xi, yi), fontsize=7, ha="left", va="bottom", alpha=0.9)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", alpha=0.35)
+
+
+def _scatter_panel_style_unlabeled(ax, xs, ys, driver_ids, point_color, xlabel, ylabel, title, annotate_size=8):
+    """Single marker colour; annotate driver ID only (no style legend)."""
+    xv = np.asarray(xs, dtype=np.float64)
+    yv = np.asarray(ys, dtype=np.float64)
+    mask = np.isfinite(xv) & np.isfinite(yv)
+    if not np.any(mask):
+        ax.text(0.5, 0.5, "no finite data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+    xv = xv[mask]
+    yv = yv[mask]
+    dv = [driver_ids[i] for i, m in enumerate(mask) if m]
+    ax.scatter(
+        xv,
+        yv,
+        c=point_color,
+        s=72,
+        alpha=0.88,
+        edgecolors="white",
+        linewidths=0.65,
+        zorder=3,
+    )
+    for xi, yi, di in zip(xv, yv, dv):
+        ax.annotate(
+            str(di),
+            (xi, yi),
+            fontsize=annotate_size,
+            ha="left",
+            va="bottom",
+            color="#222222",
+            alpha=0.95,
+        )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", alpha=0.35)
+
+
+def _plot_overtaking_heatmap(rows, z_mat, feature_keys, out_path, subtitle=""):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not rows or z_mat is None or len(z_mat) < 1:
+        return
+    # Sort by aggression proxy on **z-scored** rows (same scale as clustering / terciles), not raw CSV features.
+    zm = np.asarray(z_mat, dtype=np.float64)
+    n = len(rows)
+    if zm.shape[0] != n:
+        return
+    proxy = np.asarray(
+        [_point_aggression_proxy(feature_keys, zm[i]) for i in range(n)],
+        dtype=np.float64,
+    )
+    order = np.argsort(proxy)
+    z_sorted = zm[order]
+
+    fig, ax = plt.subplots(figsize=(10, 8), dpi=120)
+    im = ax.imshow(z_sorted, aspect="auto", cmap="RdYlGn_r", vmin=-2.5, vmax=2.5)
+    ax.set_yticks(range(len(rows)))
+    ylabels = []
+    for i in order:
+        r = rows[int(i)]
+        lbl = r.get("style_label", "")
+        sc = float(proxy[int(i)])
+        ylabels.append(
+            "{} {} (c{}) {:+.2f}".format(r.get("driver_id", ""), lbl, r.get("cluster_id", ""), sc)
+        )
+    ax.set_yticklabels(ylabels, fontsize=9)
+    ax.set_xticks(range(len(feature_keys)))
+    ax.set_xticklabels(feature_keys, rotation=45, ha="right", fontsize=9)
+    fig.colorbar(im, ax=ax, shrink=0.8, label="z-score")
+    ttl = "Overtaking style features (z-scored, rows sorted by aggression proxy on z-features)"
+    if subtitle:
+        ttl += " [{}]".format(subtitle)
+    ax.set_title(ttl)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("[plot] heatmap -> {}".format(out_path))
+
+
+def _plot_overtaking_raw_pairs(rows, out_path, subtitle=""):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    if not rows:
+        return
+    drivers = [r.get("driver_id", "") for r in rows]
+    colors = [_style_color(r.get("style_label")) for r in rows]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9), dpi=120)
+    flat = axes.flat
+    for idx, spec in enumerate(OVERTAKING_RAW_PAIR_SPECS):
+        if idx >= len(flat):
+            break
+        (k0, k1), xl, yl, ttl = spec
+        ax = flat[idx]
+        xs = [_plot_row_float(r, k0) for r in rows]
+        ys = [_plot_row_float(r, k1) for r in rows]
+        _scatter_panel_style(ax, xs, ys, drivers, colors, xl, yl, ttl)
+
+    seen = {}
+    for r in rows:
+        lbl = str(r.get("style_label", ""))
+        if lbl and lbl not in seen:
+            seen[lbl] = _style_color(lbl)
+    handles = [Patch(facecolor=c, label=l) for l, c in sorted(seen.items())]
+    if handles:
+        fig.legend(handles=handles, loc="upper right", framealpha=0.92)
+    st = "Overtaking — raw maneuver statistics (per driver median)"
+    if subtitle:
+        st += " [{}]".format(subtitle)
+    fig.suptitle(st, fontsize=12, y=1.02)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print("[plot] scatter raw pairs -> {}".format(out_path))
+
+
+def _plot_overtaking_raw_pairs_unlabeled(
+    rows,
+    out_path,
+    point_color="#1f77b4",
+    title=None,
+    subtitle="",
+):
+    """Same 2x2 raw-pair grid as styled plot; uniform colour, no style legend."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not rows:
+        return
+    drivers = [r.get("driver_id", "") for r in rows]
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9), dpi=120)
+    flat = axes.flat
+    for idx, spec in enumerate(OVERTAKING_RAW_PAIR_SPECS):
+        if idx >= len(flat):
+            break
+        (k0, k1), xl, yl, ttl = spec
+        ax = flat[idx]
+        xs = [_plot_row_float(r, k0) for r in rows]
+        ys = [_plot_row_float(r, k1) for r in rows]
+        _scatter_panel_style_unlabeled(ax, xs, ys, drivers, point_color, xl, yl, ttl)
+
+    st = title or "Overtaking — per-driver raw statistics (unlabeled)"
+    if subtitle:
+        st += " [{}]".format(subtitle)
+    fig.suptitle(st, fontsize=12, y=1.02)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print("[plot] scatter raw pairs (unlabeled) -> {}".format(out_path))
 
 
 def feature_catalog_dictionary():
@@ -184,6 +519,20 @@ def _driver_sort_key(did):
     if m:
         return (0, int(m.group(1)), "")
     return (1, 0, did)
+
+
+def _style_report_order(style_names):
+    """Print / CSV order: conservative → neutral → aggressive, then tier_*, then rest."""
+    pri = {"conservative": 0, "neutral": 1, "aggressive": 2}
+
+    def key(s):
+        if s in pri:
+            return (0, pri[s], s)
+        if str(s).startswith("tier_"):
+            return (1, s)
+        return (2, s)
+
+    return sorted(style_names, key=key)
 
 
 def _semantic_style_labels(k_eff, ordered_labs_from_low_agg):
@@ -518,7 +867,33 @@ def _point_aggression_proxy(cluster_features, vec):
     )
 
 
-def assign_kmeans_styles(rows, dim_weights, seed, n_clusters=3):
+def _tercile_style_per_driver(cluster_features, points):
+    """
+    Same split as following heatmap terciles: n_cons = n//3, n_neut = n - 2*(n//3), rest aggressive.
+    Returns (list of style str per row index, counts dict).
+    """
+    n_d = len(points)
+    scores = np.asarray(
+        [_point_aggression_proxy(cluster_features, points[i]) for i in range(n_d)],
+        dtype=np.float64,
+    )
+    order = np.argsort(scores)
+    n_cons = n_d // 3
+    n_neut = n_d - 2 * (n_d // 3)
+    n_aggr = n_d - n_cons - n_neut
+    out = [None] * n_d
+    for rank, di in enumerate(order):
+        di = int(di)
+        if rank < n_cons:
+            out[di] = "conservative"
+        elif rank < n_cons + n_neut:
+            out[di] = "neutral"
+        else:
+            out[di] = "aggressive"
+    return out, {"n_conservative": n_cons, "n_neutral": n_neut, "n_aggressive": n_aggr}
+
+
+def assign_kmeans_styles(rows, dim_weights, seed, n_clusters=3, style_label_mode="terciles"):
     cluster_features = list(CLUSTER_FEATURES)
     n_d = len(rows)
     if n_d == 0:
@@ -539,8 +914,8 @@ def assign_kmeans_styles(rows, dim_weights, seed, n_clusters=3):
             )
         )
 
-    points = _zscore_matrix(rows, cluster_features)
-    labels, _ = _kmeans(points, k_eff, seed, dim_weights=dim_weights)
+    points = _zscore_feature_matrix(rows, cluster_features)
+    labels, _ = _kmeans_weighted(points, k_eff, seed, dim_weights=dim_weights)
 
     cluster_scores = {}
     for lab in range(k_eff):
@@ -554,22 +929,46 @@ def assign_kmeans_styles(rows, dim_weights, seed, n_clusters=3):
     ordered = sorted(range(k_eff), key=lambda x: cluster_scores[x])
     label_name = _semantic_style_labels(k_eff, ordered)
 
-    for i, r in enumerate(rows):
-        r["cluster_id"] = labels[i]
-        r["style_label"] = label_name[labels[i]]
+    mode = str(style_label_mode or "terciles").strip().lower()
+    tercile_counts = None
+    assignment_note = "kmeans_cluster_mean_order"
+
+    if mode == "terciles" and k_eff == 3:
+        styles_per_i, tercile_counts = _tercile_style_per_driver(cluster_features, points)
+        for i, r in enumerate(rows):
+            r["cluster_id"] = int(labels[i])
+            r["style_label"] = styles_per_i[i]
+        assignment_note = "tercile_on_aggression_proxy_zfeatures"
+        print(
+            "[INFO] style labels: terciles on aggression proxy (balanced thirds) "
+            "conservative={} neutral={} aggressive={}".format(
+                tercile_counts["n_conservative"],
+                tercile_counts["n_neutral"],
+                tercile_counts["n_aggressive"],
+            ),
+        )
+    else:
+        if mode == "terciles" and k_eff != 3:
+            print(
+                "[INFO] style_labels=terciles needs k_effective==3; got k_eff={}. "
+                "Using k-means cluster order for names.".format(k_eff),
+            )
+        for i, r in enumerate(rows):
+            r["cluster_id"] = int(labels[i])
+            r["style_label"] = label_name[labels[i]]
 
     return {
         "points": points,
         "cluster_features": cluster_features,
         "numeric_cluster_to_style": label_name,
+        "style_label_assignment": assignment_note,
+        "style_tercile_counts": tercile_counts,
         "k_requested": k_req,
         "k_effective": k_eff,
     }
 
 
 def _style_prototype_summary(rows, points, cluster_features, dim_weights=None):
-    import numpy as np
-
     w = np.ones(len(cluster_features), dtype=np.float64)
     if dim_weights is not None:
         w = np.asarray(dim_weights, dtype=np.float64)
@@ -583,16 +982,95 @@ def _style_prototype_summary(rows, points, cluster_features, dim_weights=None):
         pts = np.asarray([points[i] for i in idxs], dtype=np.float64)
         c = pts.mean(axis=0)
         d2 = np.sum(w * (pts - c) ** 2, axis=1)
-        j = int(np.argmin(d2))
-        proto_i = idxs[j]
+        order_local = np.argsort(d2)
+        ranking = []
+        for rnk, j in enumerate(order_local, start=1):
+            ii = idxs[int(j)]
+            ranking.append(
+                {
+                    "rank": rnk,
+                    "driver_id": rows[ii]["driver_id"],
+                    "weighted_dist2_to_centroid": float(d2[int(j)]),
+                }
+            )
+        j0 = int(order_local[0])
+        proto_i = idxs[j0]
         summary[sty] = {
             "prototype_driver": rows[proto_i]["driver_id"],
+            "typicality_ranking": ranking,
             "drivers_in_style": [rows[i]["driver_id"] for i in idxs],
             "n_drivers": len(idxs),
             "cluster_id_numeric": int(rows[proto_i]["cluster_id"]),
             "prototype_features": {k: rows[proto_i].get(k) for k in cluster_features},
         }
     return summary
+
+
+def _save_cluster_plot(rows, zpoints, out_path, subtitle=""):
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[WARN] matplotlib not installed; skip PCA figure.")
+        return
+
+    xy, var_frac = _pca2_xy(zpoints)
+    if xy is None:
+        print("[WARN] Need at least 2 drivers for PCA plot.")
+        return
+
+    styles_present = []
+    seen = set()
+    for r in rows:
+        s = r.get("style_label")
+        if s not in seen:
+            seen.add(s)
+            styles_present.append(s)
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    for style in styles_present:
+        idx = [i for i, r in enumerate(rows) if r.get("style_label") == style]
+        if not idx:
+            continue
+        c = _style_color(style)
+        ax.scatter(
+            xy[idx, 0],
+            xy[idx, 1],
+            s=120,
+            c=c,
+            label=style,
+            edgecolors="0.3",
+            linewidths=0.6,
+            zorder=2,
+        )
+    for i, r in enumerate(rows):
+        ax.annotate(
+            r.get("driver_id", str(i)),
+            (xy[i, 0], xy[i, 1]),
+            fontsize=9,
+            xytext=(4, 3),
+            textcoords="offset points",
+            color="0.15",
+        )
+    vf = np.asarray(var_frac, dtype=np.float64).ravel()
+    pct0 = 100.0 * float(vf[0]) if vf.size > 0 else 0.0
+    pct1 = 100.0 * float(vf[1]) if vf.size > 1 else 0.0
+    ax.set_xlabel("PC1 ({:.0f}% variance)".format(pct0))
+    ax.set_ylabel("PC2 ({:.0f}% variance)".format(pct1))
+    ax.set_title(
+        "Overtaking style clusters (PCA on z-scored maneuver features){}".format(
+            " [{}]".format(subtitle) if subtitle else ""
+        )
+    )
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend(loc="best", framealpha=0.9)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("[plot] PCA -> {}".format(out_path))
 
 
 def run_clustering_bundle(
@@ -607,7 +1085,7 @@ def run_clustering_bundle(
     """
     Build features, cluster, write CSV/JSON/optional plot under ``dest_dir``.
 
-    ``plot_path_override``: if non-empty, use as PNG path when ``--plot``; else default under dest_dir.
+    ``plot_path_override``: if non-empty, use as PCA PNG path when ``--plot``; else default under dest_dir.
     Returns a JSON-serializable summary dict.
     """
     tag_log = experiment_tag if experiment_tag != "_merged" else "all_maneuvers"
@@ -676,7 +1154,13 @@ def run_clustering_bundle(
     )
     print("[INFO] bundle {!r}: drivers used for clustering: {}".format(tag_log, len(rows)))
 
-    result = assign_kmeans_styles(rows, dim_weights, args.seed, n_clusters=args.n_clusters)
+    result = assign_kmeans_styles(
+        rows,
+        dim_weights,
+        args.seed,
+        n_clusters=args.n_clusters,
+        style_label_mode=getattr(args, "style_labels", "terciles"),
+    )
     points = result["points"]
 
     os.makedirs(dest_dir, exist_ok=True)
@@ -699,6 +1183,12 @@ def run_clustering_bundle(
         json.dump(cat, f_fc, ensure_ascii=False, indent=2)
 
     proto_path = os.path.join(dest_dir, "overtaking_style_prototypes.json")
+    typical_csv_path = os.path.join(dest_dir, "overtaking_style_typical_drivers.csv")
+    typical_method = (
+        "Per style, drivers ranked by ascending weighted squared distance to the cluster mean "
+        "in z-scored feature space (same dimension weights as k-means). "
+        "prototype_driver is rank 1 (closest to the mean)."
+    )
     with open(proto_path, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -710,6 +1200,9 @@ def run_clustering_bundle(
                 "clustering_k_requested": result.get("k_requested"),
                 "clustering_k_effective": result.get("k_effective"),
                 "numeric_cluster_to_style": result.get("numeric_cluster_to_style"),
+                "style_label_assignment": result.get("style_label_assignment"),
+                "style_tercile_counts": result.get("style_tercile_counts"),
+                "typical_driver_method": typical_method,
                 "segment_source": (
                     "segment_overtaking_phases.segment_indices on time-ordered rows; "
                     "phase_merge = concat *__phase_MM_*.csv per clip; "
@@ -732,12 +1225,49 @@ def run_clustering_bundle(
             indent=2,
         )
 
+    with open(typical_csv_path, "w", newline="", encoding="utf-8") as f_tc:
+        wtc = csv.DictWriter(
+            f_tc,
+            fieldnames=["style_label", "rank", "driver_id", "weighted_dist2_to_centroid"],
+        )
+        wtc.writeheader()
+        for sty in _style_report_order(proto_summary.keys()):
+            for entry in proto_summary[sty]["typicality_ranking"]:
+                wtc.writerow(
+                    {
+                        "style_label": sty,
+                        "rank": entry["rank"],
+                        "driver_id": entry["driver_id"],
+                        "weighted_dist2_to_centroid": entry["weighted_dist2_to_centroid"],
+                    }
+                )
+
     print("[OK] bundle {!r}: feature catalog: {}".format(tag_log, fc_path))
     print("[OK] bundle {!r}: prototypes: {}".format(tag_log, proto_path))
+    print("[OK] bundle {!r}: typical drivers (ranked): {}".format(tag_log, typical_csv_path))
     print("[OK] bundle {!r}: drivers: {}".format(tag_log, len(rows)))
     print("[OK] bundle {!r}: output: {}".format(tag_log, out_fp))
     for r in rows:
         print("  {} / {}: {}".format(tag_log, r["driver_id"], r["style_label"]))
+
+    print(
+        "[INFO] bundle {!r} — typical drivers (weighted z-space distance to cluster mean; lower = more typical):".format(
+            tag_log,
+        )
+    )
+    for sty in _style_report_order(proto_summary.keys()):
+        info = proto_summary[sty]
+        order_ids = [x["driver_id"] for x in info["typicality_ranking"]]
+        tail = " …" if len(order_ids) > 8 else ""
+        preview = " > ".join(order_ids[:8])
+        print(
+            "  {:<14} prototype={}  (all ranks: {}{})".format(
+                sty + ":",
+                info["prototype_driver"],
+                preview,
+                tail,
+            )
+        )
 
     subtitle = "" if experiment_tag == "_merged" else str(experiment_tag)
     if args.plot:
@@ -747,85 +1277,28 @@ def run_clustering_bundle(
             plot_fp = os.path.join(dest_dir, "overtaking_style_clusters_pca.png")
         _save_cluster_plot(rows, points, plot_fp, subtitle=subtitle)
 
+        heatmap_fp = os.path.join(dest_dir, "overtaking_style_heatmap.png")
+        _plot_overtaking_heatmap(rows, points, cluster_features, heatmap_fp, subtitle=subtitle)
+
+        raw_pairs_fp = os.path.join(dest_dir, "overtaking_style_scatter_raw_pairs.png")
+        _plot_overtaking_raw_pairs(rows, raw_pairs_fp, subtitle=subtitle)
+
+        unlab_fp = os.path.join(dest_dir, "overtaking_style_raw_pairs_unlabeled.png")
+        _plot_overtaking_raw_pairs_unlabeled(
+            rows,
+            unlab_fp,
+            getattr(args, "raw_unlabeled_color", "#1f77b4"),
+            title=getattr(args, "raw_unlabeled_title", None),
+            subtitle=subtitle,
+        )
+
     rec["ok"] = True
     rec["csv_path"] = out_fp
     rec["prototypes_path"] = proto_path
+    rec["typical_drivers_csv"] = typical_csv_path
     rec["feature_catalog_path"] = fc_path
     rec["clustering_k_effective"] = result.get("k_effective")
     return rec
-
-
-def _save_cluster_plot(rows, zpoints, out_path, subtitle=""):
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("[WARN] matplotlib not installed; skip figure.")
-        return
-
-    xy, var_frac = _pca2(zpoints)
-    if xy is None:
-        print("[WARN] Need at least 2 drivers for PCA plot.")
-        return
-
-    palette = [
-        "#27ae60",
-        "#3498db",
-        "#e74c3c",
-        "#9b59b6",
-        "#f39c12",
-        "#1abc9c",
-        "#34495e",
-        "#e67e22",
-    ]
-    styles_present = []
-    seen = set()
-    for r in rows:
-        s = r.get("style_label")
-        if s not in seen:
-            seen.add(s)
-            styles_present.append(s)
-
-    fig, ax = plt.subplots(figsize=(9, 7))
-    for si, style in enumerate(styles_present):
-        idx = [i for i, r in enumerate(rows) if r.get("style_label") == style]
-        if not idx:
-            continue
-        c = palette[si % len(palette)]
-        ax.scatter(
-            xy[idx, 0],
-            xy[idx, 1],
-            s=120,
-            c=c,
-            label=style,
-            edgecolors="0.3",
-            linewidths=0.6,
-            zorder=2,
-        )
-    for i, r in enumerate(rows):
-        ax.annotate(
-            r.get("driver_id", str(i)),
-            (xy[i, 0], xy[i, 1]),
-            fontsize=9,
-            xytext=(4, 3),
-            textcoords="offset points",
-            color="0.15",
-        )
-    pct0 = 100.0 * var_frac[0] if var_frac else 0.0
-    pct1 = 100.0 * var_frac[1] if len(var_frac) > 1 else 0.0
-    ax.set_xlabel("PC1 ({:.0f}% variance)".format(pct0))
-    ax.set_ylabel("PC2 ({:.0f}% variance)".format(pct1))
-    ax.set_title("Overtaking style clusters (PCA on z-scored maneuver features){}".format(
-        " [{}]".format(subtitle) if subtitle else ""
-    ))
-    ax.grid(True, linestyle="--", alpha=0.35)
-    ax.legend(loc="best", framealpha=0.9)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print("[OK] figure:", out_path)
 
 
 def main():
@@ -841,8 +1314,35 @@ def main():
         default=os.path.join(_REPO_ROOT, "overtaking", "outputs", "overtaking_style_clusters"),
     )
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--plot", action="store_true")
-    ap.add_argument("--plot_path", type=str, default="")
+    ap.add_argument(
+        "--plot",
+        action="store_true",
+        help="PCA + heatmap + raw-pair scatters (style-coloured + unlabeled).",
+    )
+    ap.add_argument(
+        "--plot_path",
+        type=str,
+        default="",
+        help="Optional path for PCA figure when a single bundle; ignored for multi exp1/exp2/exp3 folders.",
+    )
+    ap.add_argument(
+        "--plot_raw_unlabeled_only",
+        action="store_true",
+        help="Skip clustering: read driver_overtaking_style_clusters.csv under --out_dir and only "
+        "write overtaking_style_raw_pairs_unlabeled.png (use bundle folder e.g. .../exp1 if split).",
+    )
+    ap.add_argument(
+        "--raw_unlabeled_color",
+        type=str,
+        default="#1f77b4",
+        help="Marker colour for overtaking_style_raw_pairs_unlabeled.png.",
+    )
+    ap.add_argument(
+        "--raw_unlabeled_title",
+        type=str,
+        default=None,
+        help="Suptitle override for unlabeled raw-pairs figure.",
+    )
     ap.add_argument("--left_y_min", type=float, default=-5.55)
     ap.add_argument("--left_y_max", type=float, default=-2.20)
     ap.add_argument("--right_y_min", type=float, default=-9.30)
@@ -866,6 +1366,16 @@ def main():
         help="k-means cluster count (capped at number of drivers with valid features; default 3).",
     )
     ap.add_argument(
+        "--style_labels",
+        choices=("terciles", "kmeans"),
+        default="terciles",
+        help=(
+            "conservative/neutral/aggressive: terciles = by aggression proxy on z-scored features, "
+            "~equal group sizes (default); kmeans = name clusters by mean proxy (sizes follow k-means). "
+            "Terciles apply only when k_effective==3."
+        ),
+    )
+    ap.add_argument(
         "--no_split_by_experiment",
         action="store_true",
         help=(
@@ -874,6 +1384,33 @@ def main():
         ),
     )
     args = ap.parse_args()
+
+    if args.plot_raw_unlabeled_only:
+        dest = os.path.abspath(args.out_dir)
+        csv_fp = os.path.join(dest, "driver_overtaking_style_clusters.csv")
+        if not os.path.isfile(csv_fp):
+            raise SystemExit(
+                "[ERR] missing {} — pass bundle directory (e.g. .../exp1) containing the drivers CSV.".format(
+                    csv_fp,
+                )
+            )
+        with open(csv_fp, "r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            raise SystemExit("[ERR] empty CSV: {}".format(csv_fp))
+        sub = os.path.basename(dest.rstrip(os.sep))
+        if sub in ("", ".", ".."):
+            sub = ""
+        out_png = os.path.join(dest, "overtaking_style_raw_pairs_unlabeled.png")
+        _plot_overtaking_raw_pairs_unlabeled(
+            rows,
+            out_png,
+            args.raw_unlabeled_color,
+            title=args.raw_unlabeled_title,
+            subtitle=sub if sub not in ("", "_merged") else "",
+        )
+        print("[OK] plot-only done")
+        return
 
     y_thr = (
         float(args.right_y_max) + float(args.ego_half_width_m)
@@ -954,15 +1491,14 @@ def main():
         print("[WARN] No bundles to cluster; exit.")
         return
 
-    multi_bundle = len(bundles) > 1
-
     bundle_summaries = []
     os.makedirs(args.out_dir, exist_ok=True)
 
+    multi_bundle = len(bundles) > 1
     pp = (
         os.path.abspath(args.plot_path.strip())
         if (
-            multi_bundle is False
+            not multi_bundle
             and args.plot
             and isinstance(args.plot_path, str)
             and args.plot_path.strip()

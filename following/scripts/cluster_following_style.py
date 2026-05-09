@@ -41,12 +41,18 @@ from ``--idm_dir`` to include the fitted ``T`` parameter as a distance feature.
   <out_dir>/following_style_features.csv      — per-driver raw + z-scored features
   <out_dir>/following_style_prototypes.json   — one prototype per style (closest to group mean)
   <out_dir>/following_style_heatmap.png       — z-score heatmap sorted by style_score
-  <out_dir>/following_style_scatter.png       — 2D PCA scatter coloured by label
+  <out_dir>/following_style_scatter.png       — D vs (R+C), coloured by label
+  <out_dir>/following_style_scatter_raw_pairs.png — raw feature scatter pairs (D/R/C axes)
+  <out_dir>/following_style_raw_pairs_unlabeled.png — same grid, single colour, driver IDs only (no style legend)
+  <out_dir>/following_style_scatter_z_axes.png — D/R/C z-score pairwise scatters
 
 ## Usage
 
     python3 following/scripts/cluster_following_style.py
-    python3 following/scripts/cluster_following_style.py --data_dir following/outputs/following_calibrated --out_dir ... --plot
+    python3 following/scripts/cluster_following_style.py --data_dir following/outputs/following_calibrated --plot --out_dir following/outputs/following_style_clusters
+
+    # Regenerate unlabeled raw-pairs figure only (reads existing following_style_features.csv in --out_dir)
+    python3 following/scripts/cluster_following_style.py --plot_raw_unlabeled_only --out_dir following/outputs/following_style_clusters
 
     python3 /home/zwx/driver_model/following/scripts/cluster_following_style.py --data_dir /home/zwx/driver_model/following/outputs/residual_gru_takeover_20s  --out_dir /home/zwx/driver_model/following/outputs/following_style_clusters_generated_20s --plot
 """
@@ -310,6 +316,88 @@ def _find_prototypes(sorted_results, labels, exclude_outliers=True):
 # Visualization
 # ======================================================================
 
+_SCATTER_LABEL_COLORS = {
+    "conservative": "#2ca02c",
+    "neutral": "#1f77b4",
+    "aggressive": "#d62728",
+}
+_SCATTER_DEFAULT_COLOR = "#7f7f7f"
+
+_AXIS_D_RAW = ("thw_median", "gap_p25")
+_AXIS_R_RAW = ("acc_std", "jerk_p75")
+_AXIS_C_RAW = ("inv_ttc_p90", "decel_p90")
+_EXTRA_RAW_PAIR = ("gap_mean", "thw_p25")
+
+
+def _build_plot_rows_for_scatter(sorted_results, labels, features, feat_keys):
+    """Row dicts for scatter plots (numeric feature values)."""
+    rows = []
+    for r in sorted_results:
+        d = r["driver"]
+        row = {
+            "driver": d,
+            "label": labels[d],
+            "score": r["score"],
+            "D": r["D"],
+            "R": r["R"],
+            "C": r["C"],
+        }
+        for k in feat_keys:
+            v = features[d].get(k, "")
+            row[k] = v
+        rows.append(row)
+    return rows
+
+
+def _plot_row_float(row, key):
+    v = row.get(key, "")
+    if v is None or v == "":
+        return float("nan")
+    if isinstance(v, (int, float)):
+        x = float(v)
+        return x if math.isfinite(x) else float("nan")
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else float("nan")
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _plot_row_label(row):
+    return str(row.get("label", "neutral") or "neutral").strip()
+
+
+def _scatter_panel_ax(ax, xs, ys, drivers, colors, xlabel, ylabel, title):
+    xv = np.asarray(xs, dtype=np.float64)
+    yv = np.asarray(ys, dtype=np.float64)
+    mask = np.isfinite(xv) & np.isfinite(yv)
+    if not np.any(mask):
+        ax.text(0.5, 0.5, "no finite data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+    xv = xv[mask]
+    yv = yv[mask]
+    dv = [drivers[i] for i, m in enumerate(mask) if m]
+    cv = [colors[i] for i, m in enumerate(mask) if m]
+    ax.scatter(xv, yv, c=cv, s=72, alpha=0.85, edgecolors="white", linewidths=0.6, zorder=3)
+    for xi, yi, di in zip(xv, yv, dv):
+        ax.annotate(str(di), (xi, yi), fontsize=7, ha="left", va="bottom", alpha=0.9)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", alpha=0.35)
+
+
+def _scatter_fig_legend(fig, loc="upper right"):
+    from matplotlib.patches import Patch
+
+    handles = [
+        Patch(facecolor=c, edgecolor="white", label=k.title())
+        for k, c in sorted(_SCATTER_LABEL_COLORS.items())
+    ]
+    fig.legend(handles=handles, loc=loc, framealpha=0.92)
+
+
 def _plot_heatmap(drivers_sorted, z_all, driver_order, labels, out_path):
     """Z-score heatmap sorted by style_score."""
     import matplotlib.pyplot as plt
@@ -351,17 +439,203 @@ def _plot_heatmap(drivers_sorted, z_all, driver_order, labels, out_path):
     print("[plot] heatmap -> {}".format(out_path))
 
 
-def _plot_scatter(drivers_sorted, labels, out_path):
-    """2D scatter: D vs (R+C), coloured by label."""
+def _plot_style_scatter_raw_pairs(rows, out_path):
+    """Raw D/R/C feature pairs (2x2 grid, optional 4th panel)."""
     import matplotlib.pyplot as plt
 
-    colors = {"conservative": "#2ca02c", "neutral": "#1f77b4", "aggressive": "#d62728"}
+    if not rows:
+        return
+    drivers = [r.get("driver", "") for r in rows]
+    colors = [_SCATTER_LABEL_COLORS.get(_plot_row_label(r), _SCATTER_DEFAULT_COLOR) for r in rows]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9), dpi=120)
+    pairs_meta = [
+        (_AXIS_D_RAW, "THW median (s)", "Gap p25 (m)", "Axis D: distance preference (raw)"),
+        (_AXIS_R_RAW, "Accel std (m/s²)", "Jerk p75 (m/s³)", "Axis R: reactivity (raw)"),
+        (_AXIS_C_RAW, "inv_TTC p90 (1/s)", "Decel p90 (m/s²)", "Axis C: closeness (raw)"),
+    ]
+    keys0 = set(rows[0].keys())
+    if _EXTRA_RAW_PAIR[0] in keys0 and _EXTRA_RAW_PAIR[1] in keys0:
+        pairs_meta.append(
+            (_EXTRA_RAW_PAIR, "Gap mean (m)", "THW p25 (s)", "Extra: gap vs THW p25 (raw)")
+        )
+
+    flat = axes.flat
+    for idx, (xy, xl, yl, ttl) in enumerate(pairs_meta):
+        if idx >= len(flat):
+            break
+        ax = flat[idx]
+        k0, k1 = xy
+        if k0 not in keys0 or k1 not in keys0:
+            ax.text(0.5, 0.5, "missing columns\n{}".format(xy), ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(ttl)
+            continue
+        xs = [_plot_row_float(r, k0) for r in rows]
+        ys = [_plot_row_float(r, k1) for r in rows]
+        _scatter_panel_ax(ax, xs, ys, drivers, colors, xl, yl, ttl)
+
+    for j in range(len(pairs_meta), len(flat)):
+        flat[j].set_visible(False)
+
+    _scatter_fig_legend(fig)
+    fig.suptitle("Following style — raw statistics", fontsize=12, y=1.02)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print("[plot] scatter raw pairs -> {}".format(out_path))
+
+
+def _scatter_panel_ax_unlabeled(ax, xs, ys, drivers, point_color, xlabel, ylabel, title, annotate_size=8):
+    """Single marker colour; annotate driver ID only (no style legend)."""
+    xv = np.asarray(xs, dtype=np.float64)
+    yv = np.asarray(ys, dtype=np.float64)
+    mask = np.isfinite(xv) & np.isfinite(yv)
+    if not np.any(mask):
+        ax.text(0.5, 0.5, "no finite data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+    xv = xv[mask]
+    yv = yv[mask]
+    dv = [drivers[i] for i, m in enumerate(mask) if m]
+    ax.scatter(
+        xv,
+        yv,
+        c=point_color,
+        s=72,
+        alpha=0.88,
+        edgecolors="white",
+        linewidths=0.65,
+        zorder=3,
+    )
+    for xi, yi, di in zip(xv, yv, dv):
+        ax.annotate(
+            str(di),
+            (xi, yi),
+            fontsize=annotate_size,
+            ha="left",
+            va="bottom",
+            color="#222222",
+            alpha=0.95,
+        )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", alpha=0.35)
+
+
+def _plot_style_scatter_raw_pairs_unlabeled(rows, out_path, point_color="#1f77b4", title=None):
+    """Raw D/R/C pairs: uniform colour, driver labels, no style legend."""
+    import matplotlib.pyplot as plt
+
+    if not rows:
+        return
+    if "driver" not in rows[0]:
+        print("[plot] skip raw_pairs_unlabeled: missing 'driver' column")
+        return
+
+    drivers = [r.get("driver", "") for r in rows]
+    keys0 = set(rows[0].keys())
+    pairs_meta = [
+        (_AXIS_D_RAW, "THW median (s)", "Gap p25 (m)", "Distance preference (raw)"),
+        (_AXIS_R_RAW, "Accel std (m/s²)", "Jerk p75 (m/s³)", "Reactivity (raw)"),
+        (_AXIS_C_RAW, "inv_TTC p90 (1/s)", "Decel p90 (m/s²)", "Closeness (raw)"),
+    ]
+    if _EXTRA_RAW_PAIR[0] in keys0 and _EXTRA_RAW_PAIR[1] in keys0:
+        pairs_meta.append(
+            (_EXTRA_RAW_PAIR, "Gap mean (m)", "THW p25 (s)", "Gap vs THW p25 (raw)")
+        )
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9), dpi=120)
+    flat = axes.flat
+    for idx, (xy, xl, yl, ttl) in enumerate(pairs_meta):
+        if idx >= len(flat):
+            break
+        ax = flat[idx]
+        k0, k1 = xy
+        if k0 not in keys0 or k1 not in keys0:
+            ax.text(0.5, 0.5, "missing columns\n{}".format(xy), ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(ttl)
+            continue
+        xs = [_plot_row_float(r, k0) for r in rows]
+        ys = [_plot_row_float(r, k1) for r in rows]
+        _scatter_panel_ax_unlabeled(ax, xs, ys, drivers, point_color, xl, yl, ttl)
+
+    for j in range(len(pairs_meta), len(flat)):
+        flat[j].set_visible(False)
+
+    fig.suptitle(
+        title or "Car-following — per-driver raw statistics (unlabeled)",
+        fontsize=12,
+        y=1.02,
+    )
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print("[plot] scatter raw pairs (unlabeled) -> {}".format(out_path))
+
+
+def _plot_style_scatter_z_axes(rows, out_path):
+    """D vs R, D vs C, R vs C (z-score axes)."""
+    import matplotlib.pyplot as plt
+
+    if not rows:
+        return
+    for c in ("D", "R", "C", "driver"):
+        if c not in rows[0]:
+            print("[plot] skip z_axes: missing column {!r}".format(c))
+            return
+
+    drivers = [r.get("driver", "") for r in rows]
+    colors = [_SCATTER_LABEL_COLORS.get(_plot_row_label(r), _SCATTER_DEFAULT_COLOR) for r in rows]
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.5), dpi=120)
+    triples = [
+        ("D", "R", "D vs R (z-score)"),
+        ("D", "C", "D vs C (z-score)"),
+        ("R", "C", "R vs C (z-score)"),
+    ]
+    for ax, (xc, yc, ttl) in zip(axes, triples):
+        xs = [_plot_row_float(r, xc) for r in rows]
+        ys = [_plot_row_float(r, yc) for r in rows]
+        _scatter_panel_ax(ax, xs, ys, drivers, colors, xc, yc, ttl)
+        ax.axhline(0, color="gray", ls="--", lw=0.7)
+        ax.axvline(0, color="gray", ls="--", lw=0.7)
+
+    _scatter_fig_legend(fig, loc="lower center")
+    fig.suptitle("Behaviour axes (within-driver z-scored features)", fontsize=12, y=1.05)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print("[plot] scatter z axes -> {}".format(out_path))
+
+
+def _plot_style_scatter_d_vs_r_plus_c(rows, out_path):
+    """2D scatter: D vs (R+C), coloured by label."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    if not rows:
+        return
+    for c in ("D", "R", "C"):
+        if c not in rows[0]:
+            print("[plot] skip d_vs_r+c: missing column {!r}".format(c))
+            return
+
+    dd = np.array([_plot_row_float(r, "D") for r in rows], dtype=np.float64)
+    rc = np.array(
+        [_plot_row_float(r, "R") + _plot_row_float(r, "C") for r in rows],
+        dtype=np.float64,
+    )
+
     fig, ax = plt.subplots(figsize=(8, 6), dpi=120)
-    for r in drivers_sorted:
-        lbl = labels[r["driver"]]
-        ax.scatter(r["D"], r["R"] + r["C"], color=colors[lbl], s=80, zorder=3)
-        ax.annotate(r["driver"], (r["D"], r["R"] + r["C"]),
-                    fontsize=8, ha="left", va="bottom")
+    for i, r in enumerate(rows):
+        lbl = _plot_row_label(r)
+        c = _SCATTER_LABEL_COLORS.get(lbl, _SCATTER_DEFAULT_COLOR)
+        ax.scatter(dd[i], rc[i], color=c, s=80, zorder=3, edgecolors="white", linewidths=0.5)
+        ax.annotate(str(r.get("driver", "")), (dd[i], rc[i]), fontsize=8, ha="left", va="bottom")
 
     ax.set_xlabel("D (Distance preference, z-score) ← conservative")
     ax.set_ylabel("R + C (Reactivity + Closeness, z-score) → aggressive")
@@ -370,12 +644,10 @@ def _plot_scatter(drivers_sorted, labels, out_path):
     ax.set_title("Following Style: Distance vs Reactivity+Closeness")
     ax.grid(True, ls="--", alpha=0.4)
 
-    # Legend
-    from matplotlib.patches import Patch
     legend_elements = [
-        Patch(facecolor=colors["conservative"], label="Conservative"),
-        Patch(facecolor=colors["neutral"], label="Neutral"),
-        Patch(facecolor=colors["aggressive"], label="Aggressive"),
+        Patch(facecolor=_SCATTER_LABEL_COLORS["conservative"], label="Conservative"),
+        Patch(facecolor=_SCATTER_LABEL_COLORS["neutral"], label="Neutral"),
+        Patch(facecolor=_SCATTER_LABEL_COLORS["aggressive"], label="Aggressive"),
     ]
     ax.legend(handles=legend_elements, loc="upper left")
 
@@ -383,7 +655,7 @@ def _plot_scatter(drivers_sorted, labels, out_path):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print("[plot] scatter -> {}".format(out_path))
+    print("[plot] scatter D vs R+C -> {}".format(out_path))
 
 
 # ======================================================================
@@ -408,8 +680,47 @@ def main():
     ap.add_argument("--w_C", type=float, default=1.0, help="Weight for Closeness axis.")
     ap.add_argument("--min_sim_time_s", type=float, default=15.0,
                     help="Only use rows with sim_time_s >= this (skip startup).")
-    ap.add_argument("--plot", action="store_true", help="Generate heatmap and scatter plots.")
+    ap.add_argument(
+        "--plot",
+        action="store_true",
+        help="Generate heatmap, scatters, raw pairs (style + unlabeled), and z-axis scatters.",
+    )
+    ap.add_argument(
+        "--plot_raw_unlabeled_only",
+        action="store_true",
+        help="Skip clustering: read following_style_features.csv under --out_dir and only write "
+        "following_style_raw_pairs_unlabeled.png",
+    )
+    ap.add_argument(
+        "--raw_unlabeled_color",
+        type=str,
+        default="#1f77b4",
+        help="Marker colour for following_style_raw_pairs_unlabeled.png (default: tab blue).",
+    )
+    ap.add_argument(
+        "--raw_unlabeled_title",
+        type=str,
+        default=None,
+        help="Suptitle for the unlabeled raw-pairs figure (default: built-in English title).",
+    )
     args = ap.parse_args()
+
+    # --- Unlabeled raw pairs only (from existing features CSV) ---
+    if args.plot_raw_unlabeled_only:
+        os.makedirs(args.out_dir, exist_ok=True)
+        feat_fp = os.path.join(args.out_dir, "following_style_features.csv")
+        if not os.path.isfile(feat_fp):
+            raise SystemExit("[ERR] missing {} (run clustering first or fix --out_dir)".format(feat_fp))
+        with open(feat_fp, "r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            raise SystemExit("[ERR] empty CSV: {}".format(feat_fp))
+        out_unl = os.path.join(args.out_dir, "following_style_raw_pairs_unlabeled.png")
+        _plot_style_scatter_raw_pairs_unlabeled(
+            rows, out_unl, point_color=args.raw_unlabeled_color, title=args.raw_unlabeled_title
+        )
+        print("\n[DONE]")
+        return
 
     # --- Discover CSVs per driver ---
     all_csvs = _discover_csvs(args.data_dir)
@@ -481,7 +792,7 @@ def main():
 
     # Features CSV
     feat_fp = os.path.join(args.out_dir, "following_style_features.csv")
-    feat_keys = ALL_SCORE_FEATURES + ["idm_T", "speed_mean", "n_rows", "n_closing"]
+    feat_keys = ALL_SCORE_FEATURES + ["gap_mean", "thw_p25", "idm_T", "speed_mean", "n_rows", "n_closing"]
     with open(feat_fp, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["driver", "label", "score", "D", "R", "C"] + feat_keys)
         w.writeheader()
@@ -496,11 +807,26 @@ def main():
 
     # --- Plots ---
     if args.plot:
+        plot_rows = _build_plot_rows_for_scatter(sorted_results, labels, features, feat_keys)
         heatmap_path = os.path.join(args.out_dir, "following_style_heatmap.png")
         _plot_heatmap(sorted_results, z_all, valid_drivers, labels, heatmap_path)
 
         scatter_path = os.path.join(args.out_dir, "following_style_scatter.png")
-        _plot_scatter(sorted_results, labels, scatter_path)
+        _plot_style_scatter_d_vs_r_plus_c(plot_rows, scatter_path)
+
+        raw_pairs_path = os.path.join(args.out_dir, "following_style_scatter_raw_pairs.png")
+        _plot_style_scatter_raw_pairs(plot_rows, raw_pairs_path)
+
+        unlabeled_path = os.path.join(args.out_dir, "following_style_raw_pairs_unlabeled.png")
+        _plot_style_scatter_raw_pairs_unlabeled(
+            plot_rows,
+            unlabeled_path,
+            point_color=args.raw_unlabeled_color,
+            title=args.raw_unlabeled_title,
+        )
+
+        z_axes_path = os.path.join(args.out_dir, "following_style_scatter_z_axes.png")
+        _plot_style_scatter_z_axes(plot_rows, z_axes_path)
 
     print("\n[DONE]")
 

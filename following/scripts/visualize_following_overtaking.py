@@ -18,8 +18,8 @@
 
 批量（无界面，递归写 PNG）::
 
-    python3 following/scripts/visualize_following_overtaking.py /path/to/session_root --batch \\
-        -o following/outputs/pictures/following_overtaking_viz
+    python3 following/scripts/visualize_following_overtaking.py overtaking/outputs/overtaking_p4_return_fix --batch \
+        -o following/outputs/pictures/overtaking_data_viz
 
 强制模式::
 
