@@ -12,9 +12,13 @@ Usage::
 
     python3 following/scripts/visualize_takeover_vs_raw.py \
         --takeover_dir following/outputs/residual_gru_takeover_20s \
-        --raw_dir following/outputs/following_calibrated \
-        --session_index 0 \
         --takeover_time_s 20.0
+
+By default the raw CSV for each driver is read from
+``<takeover_dir>/generation_summary.csv`` (``source_csv`` column), so the plot
+compares each generated trajectory against the exact calibrated session used to
+generate it. Use ``--raw_selection index`` to fall back to the old
+``--session_index`` lookup.
 
 Output PNGs go to
 ``following/outputs/pictures/residual_gru_takeover_vs_raw/<T*>/driving_data.png``.
@@ -22,10 +26,10 @@ Output PNGs go to
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
-import os
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -40,6 +44,21 @@ def _raw_path_for(driver: str, raw_dir: Path, session_index: int) -> Optional[Pa
     if idx < 0 or idx >= len(sessions):
         return None
     return Path(sessions[idx]) / "driving_data.csv"
+
+
+def _load_generation_sources(takeover_dir: Path) -> Dict[str, Path]:
+    summary_csv = takeover_dir / "generation_summary.csv"
+    out: Dict[str, Path] = {}
+    if not summary_csv.is_file():
+        return out
+    with summary_csv.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            driver = str(row.get("driver_id", "")).strip()
+            source = str(row.get("source_csv", "")).strip()
+            if driver and source:
+                out[driver] = Path(source)
+    return out
 
 
 def _load_csv(path: Path) -> Optional[pd.DataFrame]:
@@ -174,6 +193,10 @@ def _plot_overlay(driver: str,
         if "gru_delta_a" in take.columns:
             ax2.plot(t_tk[mask], take.loc[mask, "gru_delta_a"], color="#9467bd",
                      lw=1.0, alpha=0.85, label="Δa (residual)")
+        if "gap_anchor_a" in take.columns:
+            ax2.plot(t_tk[mask], take.loc[mask, "gap_anchor_a"], color="#ff7f0e",
+                     lw=1.0, ls="--", alpha=0.85, label="gap anchor a")
+        if "gru_delta_a" in take.columns or "gap_anchor_a" in take.columns:
             ax2.set_ylabel("Δa (m/s²)", color="#9467bd")
             ax2.legend(loc="upper right", fontsize=9)
 
@@ -200,7 +223,10 @@ def main() -> None:
                     default="/home/zwx/driver_model/following/outputs/pictures/residual_gru_takeover_vs_raw")
     ap.add_argument("--session_index", type=int, default=-1,
                     help="0-based index of the raw session to compare against. "
-                         "Default -1 = last session (sorted alphabetically).")
+                         "Only used with --raw_selection index. Default -1 = last session.")
+    ap.add_argument("--raw_selection", type=str, default="generation_summary",
+                    choices=["generation_summary", "index"],
+                    help="How to choose the raw CSV. Default uses takeover_dir/generation_summary.csv.")
     ap.add_argument("--takeover_time_s", type=float, default=20.0)
     ap.add_argument("--drivers", type=str, default="")
     args = ap.parse_args()
@@ -208,6 +234,12 @@ def main() -> None:
     take_dir = Path(args.takeover_dir)
     raw_dir = Path(args.raw_dir)
     out_dir = Path(args.out_dir)
+    generation_sources = _load_generation_sources(take_dir) if args.raw_selection == "generation_summary" else {}
+    if args.raw_selection == "generation_summary":
+        if generation_sources:
+            print("[INFO] loaded raw source mapping from {}".format(take_dir / "generation_summary.csv"))
+        else:
+            print("[WARN] generation_summary.csv not found or empty; falling back to --session_index lookup.")
 
     # enumerate drivers from takeover_dir
     drivers = []
@@ -220,7 +252,11 @@ def main() -> None:
     summary_rows = []
     for d in drivers:
         take_csv = take_dir / d / "driving_data.csv"
-        raw_csv = _raw_path_for(d, raw_dir, args.session_index)
+        raw_csv = generation_sources.get(d)
+        raw_source = "generation_summary"
+        if raw_csv is None or not raw_csv.is_file():
+            raw_csv = _raw_path_for(d, raw_dir, args.session_index)
+            raw_source = "index:{}".format(args.session_index)
         if raw_csv is None or not raw_csv.is_file():
             print("[SKIP] {}: raw CSV not found (session_index={})".format(d, args.session_index))
             continue
@@ -245,6 +281,7 @@ def main() -> None:
         summary_rows.append(dict(
             driver=d,
             raw_csv=str(raw_csv),
+            raw_source=raw_source,
             take_csv=str(take_csv),
             out_png=str(out_png),
             **metrics,
