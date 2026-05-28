@@ -388,14 +388,61 @@ def _scatter_panel_ax(ax, xs, ys, drivers, colors, xlabel, ylabel, title):
     ax.grid(True, linestyle="--", alpha=0.35)
 
 
-def _scatter_fig_legend(fig, loc="upper right"):
-    from matplotlib.patches import Patch
+_STYLE_LEGEND_ORDER = ("conservative", "neutral", "aggressive")
 
-    handles = [
-        Patch(facecolor=c, edgecolor="white", label=k.title())
-        for k, c in sorted(_SCATTER_LABEL_COLORS.items())
+
+def _style_legend_handles():
+    from matplotlib.lines import Line2D
+
+    return [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="none",
+            markersize=8,
+            markerfacecolor=_SCATTER_LABEL_COLORS[k],
+            markeredgecolor="0.3",
+            markeredgewidth=0.6,
+            label=k.title(),
+        )
+        for k in _STYLE_LEGEND_ORDER
     ]
-    fig.legend(handles=handles, loc=loc, framealpha=0.92)
+
+
+def _add_style_legend(
+    target,
+    *,
+    loc="lower center",
+    bbox_to_anchor=(0.5, -0.02),
+    ncol=3,
+    text_rotation=0,
+    labelspacing=0.5,
+    handletextpad=0.8,
+    borderaxespad=0.0,
+    framealpha=0.92,
+):
+    """Style legend with circular markers (aligned with overtaking PCA scatter)."""
+    leg = target.legend(
+        handles=_style_legend_handles(),
+        loc=loc,
+        bbox_to_anchor=bbox_to_anchor,
+        ncol=ncol,
+        framealpha=framealpha,
+        labelspacing=labelspacing,
+        handletextpad=handletextpad,
+        borderaxespad=borderaxespad,
+    )
+    if text_rotation:
+        for txt in leg.get_texts():
+            txt.set_rotation(text_rotation)
+            txt.set_ha("center")
+            txt.set_va("center")
+    return leg
+
+
+def _scatter_fig_legend(fig, loc="lower center", bbox_to_anchor=(0.5, -0.02), ncol=3):
+    return _add_style_legend(fig, loc=loc, bbox_to_anchor=bbox_to_anchor, ncol=ncol)
 
 
 def _plot_heatmap(drivers_sorted, z_all, driver_order, labels, out_path):
@@ -414,7 +461,7 @@ def _plot_heatmap(drivers_sorted, z_all, driver_order, labels, out_path):
     for r in drivers_sorted:
         lbl = labels[r["driver"]]
         marker = {"conservative": "●", "neutral": "◆", "aggressive": "▲"}[lbl]
-        ylabels.append("{} {} ({:.2f})".format(marker, r["driver"], r["score"]))
+        ylabels.append("{} {} ({:+.2f})".format(marker, r["driver"], r["score"]))
     ax.set_yticklabels(ylabels, fontsize=9)
 
     ax.set_xticks(range(len(ALL_SCORE_FEATURES)))
@@ -431,7 +478,7 @@ def _plot_heatmap(drivers_sorted, z_all, driver_order, labels, out_path):
     ax.axhline(n_cons - 0.5, color="black", lw=1.5, ls="--")
     ax.axhline(n_cons + n_neut - 0.5, color="black", lw=1.5, ls="--")
 
-    ax.set_title("Following Style Features (sorted by aggressiveness score)")
+    ax.set_title("Following style features (z-scored, rows sorted by aggressiveness score)")
     plt.tight_layout()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -450,14 +497,14 @@ def _plot_style_scatter_raw_pairs(rows, out_path):
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 9), dpi=120)
     pairs_meta = [
-        (_AXIS_D_RAW, "THW median (s)", "Gap p25 (m)", "Axis D: distance preference (raw)"),
-        (_AXIS_R_RAW, "Accel std (m/s²)", "Jerk p75 (m/s³)", "Axis R: reactivity (raw)"),
-        (_AXIS_C_RAW, "inv_TTC p90 (1/s)", "Decel p90 (m/s²)", "Axis C: closeness (raw)"),
+        (_AXIS_D_RAW, "THW median (s)", "Gap p25 (m)", "Axis D: distance preference"),
+        (_AXIS_R_RAW, "Accel std (m/s²)", "Jerk p75 (m/s³)", "Axis R: reactivity"),
+        (_AXIS_C_RAW, "inv_TTC p90 (1/s)", "Decel p90 (m/s²)", "Axis C: closeness"),
     ]
     keys0 = set(rows[0].keys())
     if _EXTRA_RAW_PAIR[0] in keys0 and _EXTRA_RAW_PAIR[1] in keys0:
         pairs_meta.append(
-            (_EXTRA_RAW_PAIR, "Gap mean (m)", "THW p25 (s)", "Extra: gap vs THW p25 (raw)")
+            (_EXTRA_RAW_PAIR, "Gap mean (m)", "THW p25 (s)", "Extra: gap vs THW p25")
         )
 
     flat = axes.flat
@@ -479,7 +526,7 @@ def _plot_style_scatter_raw_pairs(rows, out_path):
 
     _scatter_fig_legend(fig)
     fig.suptitle("Following style — raw statistics", fontsize=12, y=1.02)
-    plt.tight_layout()
+    plt.tight_layout(rect=(0.0, 0.05, 1.0, 1.0))
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -537,13 +584,13 @@ def _plot_style_scatter_raw_pairs_unlabeled(rows, out_path, point_color="#1f77b4
     drivers = [r.get("driver", "") for r in rows]
     keys0 = set(rows[0].keys())
     pairs_meta = [
-        (_AXIS_D_RAW, "THW median (s)", "Gap p25 (m)", "Distance preference (raw)"),
-        (_AXIS_R_RAW, "Accel std (m/s²)", "Jerk p75 (m/s³)", "Reactivity (raw)"),
-        (_AXIS_C_RAW, "inv_TTC p90 (1/s)", "Decel p90 (m/s²)", "Closeness (raw)"),
+        (_AXIS_D_RAW, "THW median (s)", "Gap p25 (m)", "Distance preference"),
+        (_AXIS_R_RAW, "Accel std (m/s²)", "Jerk p75 (m/s³)", "Reactivity"),
+        (_AXIS_C_RAW, "inv_TTC p90 (1/s)", "Decel p90 (m/s²)", "Closeness"),
     ]
     if _EXTRA_RAW_PAIR[0] in keys0 and _EXTRA_RAW_PAIR[1] in keys0:
         pairs_meta.append(
-            (_EXTRA_RAW_PAIR, "Gap mean (m)", "THW p25 (s)", "Gap vs THW p25 (raw)")
+            (_EXTRA_RAW_PAIR, "Gap mean (m)", "THW p25 (s)", "Gap vs THW p25")
         )
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 9), dpi=120)
@@ -603,9 +650,9 @@ def _plot_style_scatter_z_axes(rows, out_path):
         ax.axhline(0, color="gray", ls="--", lw=0.7)
         ax.axvline(0, color="gray", ls="--", lw=0.7)
 
-    _scatter_fig_legend(fig, loc="lower center")
-    fig.suptitle("Behaviour axes (within-driver z-scored features)", fontsize=12, y=1.05)
-    plt.tight_layout()
+    _scatter_fig_legend(fig, loc="lower center", bbox_to_anchor=(0.5, 0.02), ncol=3)
+    fig.suptitle("Behaviour axes (within-driver z-scored features)", fontsize=12, y=0.98)
+    plt.tight_layout(rect=(0.0, 0.06, 1.0, 0.91))
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -615,7 +662,6 @@ def _plot_style_scatter_z_axes(rows, out_path):
 def _plot_style_scatter_d_vs_r_plus_c(rows, out_path):
     """2D scatter: D vs (R+C), coloured by label."""
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
 
     if not rows:
         return
@@ -644,12 +690,7 @@ def _plot_style_scatter_d_vs_r_plus_c(rows, out_path):
     ax.set_title("Following Style: Distance vs Reactivity+Closeness")
     ax.grid(True, ls="--", alpha=0.4)
 
-    legend_elements = [
-        Patch(facecolor=_SCATTER_LABEL_COLORS["conservative"], label="Conservative"),
-        Patch(facecolor=_SCATTER_LABEL_COLORS["neutral"], label="Neutral"),
-        Patch(facecolor=_SCATTER_LABEL_COLORS["aggressive"], label="Aggressive"),
-    ]
-    ax.legend(handles=legend_elements, loc="upper left")
+    ax.legend(handles=_style_legend_handles(), loc="upper right", framealpha=0.92)
 
     plt.tight_layout()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)

@@ -120,6 +120,7 @@ _STYLE_COLORS = {
     "neutral": "#1f77b4",
     "aggressive": "#d62728",
 }
+_STYLE_LEGEND_ORDER = ("conservative", "neutral", "aggressive")
 _STYLE_FALLBACK = "#7f7f7f"
 
 
@@ -300,18 +301,24 @@ def _plot_overtaking_heatmap(rows, z_mat, feature_keys, out_path, subtitle=""):
     im = ax.imshow(z_sorted, aspect="auto", cmap="RdYlGn_r", vmin=-2.5, vmax=2.5)
     ax.set_yticks(range(len(rows)))
     ylabels = []
+    style_markers = {"conservative": "●", "neutral": "◆", "aggressive": "▲"}
     for i in order:
         r = rows[int(i)]
         lbl = r.get("style_label", "")
         sc = float(proxy[int(i)])
-        ylabels.append(
-            "{} {} (c{}) {:+.2f}".format(r.get("driver_id", ""), lbl, r.get("cluster_id", ""), sc)
-        )
+        marker = style_markers.get(lbl, "•")
+        ylabels.append("{} {} ({:+.2f})".format(marker, r.get("driver_id", ""), sc))
     ax.set_yticklabels(ylabels, fontsize=9)
     ax.set_xticks(range(len(feature_keys)))
     ax.set_xticklabels(feature_keys, rotation=45, ha="right", fontsize=9)
     fig.colorbar(im, ax=ax, shrink=0.8, label="z-score")
-    ttl = "Overtaking style features (z-scored, rows sorted by aggression proxy on z-features)"
+    # Keep row separators consistent with following heatmaps under the default tercile split.
+    n_cons = n // 3
+    n_neut = n - 2 * (n // 3)
+    ax.axhline(n_cons - 0.5, color="black", lw=1.5, ls="--")
+    ax.axhline(n_cons + n_neut - 0.5, color="black", lw=1.5, ls="--")
+
+    ttl = "Overtaking style features (z-scored, rows sorted by aggressiveness score)"
     if subtitle:
         ttl += " [{}]".format(subtitle)
     ax.set_title(ttl)
@@ -327,7 +334,7 @@ def _plot_overtaking_raw_pairs(rows, out_path, subtitle=""):
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
 
     if not rows:
         return
@@ -350,14 +357,34 @@ def _plot_overtaking_raw_pairs(rows, out_path, subtitle=""):
         lbl = str(r.get("style_label", ""))
         if lbl and lbl not in seen:
             seen[lbl] = _style_color(lbl)
-    handles = [Patch(facecolor=c, label=l) for l, c in sorted(seen.items())]
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="none",
+            markersize=8,
+            markerfacecolor=_style_color(lbl),
+            markeredgecolor="0.3",
+            markeredgewidth=0.6,
+            label=lbl.title(),
+        )
+        for lbl in _STYLE_LEGEND_ORDER
+        if lbl in seen
+    ]
     if handles:
-        fig.legend(handles=handles, loc="upper right", framealpha=0.92)
+        fig.legend(
+            handles=handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.02),
+            ncol=min(3, len(handles)),
+            framealpha=0.92,
+        )
     st = "Overtaking — raw maneuver statistics (per driver median)"
     if subtitle:
         st += " [{}]".format(subtitle)
     fig.suptitle(st, fontsize=12, y=1.02)
-    plt.tight_layout()
+    plt.tight_layout(rect=(0.0, 0.04, 1.0, 1.0))
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -1021,16 +1048,12 @@ def _save_cluster_plot(rows, zpoints, out_path, subtitle=""):
         print("[WARN] Need at least 2 drivers for PCA plot.")
         return
 
-    styles_present = []
-    seen = set()
-    for r in rows:
-        s = r.get("style_label")
-        if s not in seen:
-            seen.add(s)
-            styles_present.append(s)
+    styles_present = {r.get("style_label") for r in rows}
 
     fig, ax = plt.subplots(figsize=(9, 7))
-    for style in styles_present:
+    for style in _STYLE_LEGEND_ORDER:
+        if style not in styles_present:
+            continue
         idx = [i for i, r in enumerate(rows) if r.get("style_label") == style]
         if not idx:
             continue
@@ -1040,7 +1063,7 @@ def _save_cluster_plot(rows, zpoints, out_path, subtitle=""):
             xy[idx, 1],
             s=120,
             c=c,
-            label=style,
+            label=style.title(),
             edgecolors="0.3",
             linewidths=0.6,
             zorder=2,
@@ -1062,11 +1085,12 @@ def _save_cluster_plot(rows, zpoints, out_path, subtitle=""):
     ax.set_title(
         "Overtaking style clusters (PCA on z-scored maneuver features){}".format(
             " [{}]".format(subtitle) if subtitle else ""
-        )
+        ),
+        pad=6,
     )
     ax.grid(True, linestyle="--", alpha=0.35)
-    ax.legend(loc="best", framealpha=0.9)
-    fig.tight_layout()
+    ax.legend(loc="lower left", bbox_to_anchor=(0.02, 0.06), framealpha=0.9, borderaxespad=0.4)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)

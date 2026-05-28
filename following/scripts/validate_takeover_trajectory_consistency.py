@@ -32,6 +32,11 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+RAW_COLOR = "#1f77b4"
+GEN_COLOR = "#ff7f0e"
+PASS_COLOR = RAW_COLOR
+FAIL_COLOR = GEN_COLOR
+
 METRIC_SPECS: Tuple[Tuple[str, Tuple[str, ...], str, bool], ...] = (
     ("speed", ("ego_speed", "ego_v_long"), "Speed (m/s)", False),
     ("accel", ("ego_acceleration", "ego_a_long"), "Accel (m/s²)", False),
@@ -293,9 +298,9 @@ def _plot_driver(
     for ax, (key, ylab) in zip(axs_ts, ts_pairs):
         r, g = metric_arrays[key]
         if r.size == len(t_r):
-            ax.plot(t_r, r, color="#1f77b4", lw=1.1, label="Raw")
+            ax.plot(t_r, r, color=RAW_COLOR, lw=1.1, label="Raw")
         if g.size == len(t_g):
-            ax.plot(t_g, g, color="#d62728", lw=1.1, alpha=0.9, label="Generated")
+            ax.plot(t_g, g, color=GEN_COLOR, lw=1.1, alpha=0.9, label="Generated")
         ax.axvline(takeover_time_s, color="0.3", ls=":", lw=1.0)
         ax.set_ylabel(ylab)
         ax.grid(True, ls="--", alpha=0.35)
@@ -312,9 +317,9 @@ def _plot_driver(
     for ax, key, ylab in zip(axs_risk, ("thw", "ttc"), ("THW (s)", "TTC (s)")):
         r, g = metric_arrays[key]
         if r.size == len(t_r):
-            ax.plot(t_r, r, color="#1f77b4", lw=1.0, label="Raw")
+            ax.plot(t_r, r, color=RAW_COLOR, lw=1.0, label="Raw")
         if g.size == len(t_g):
-            ax.plot(t_g, g, color="#d62728", lw=1.0, label="Generated")
+            ax.plot(t_g, g, color=GEN_COLOR, lw=1.0, label="Generated")
         ax.axvline(takeover_time_s, color="0.3", ls=":", lw=1.0)
         ax.set_ylabel(ylab)
         ax.grid(True, ls="--", alpha=0.35)
@@ -343,9 +348,9 @@ def _plot_driver(
         r = r[np.isfinite(r)]
         g = g[np.isfinite(g)]
         if r.size:
-            ax.hist(r, bins=40, density=True, alpha=0.45, color="#1f77b4", label="Raw")
+            ax.hist(r, bins=40, density=True, alpha=0.45, color=RAW_COLOR, label="Raw")
         if g.size:
-            ax.hist(g, bins=40, density=True, alpha=0.45, color="#d62728", label="Gen")
+            ax.hist(g, bins=40, density=True, alpha=0.45, color=GEN_COLOR, label="Gen")
         ax.set_title(key, fontsize=9)
         ax.set_xlabel(hist_labels[key], fontsize=8)
         ax.grid(True, ls="--", alpha=0.25)
@@ -367,7 +372,7 @@ def _plot_fleet(summary_df: pd.DataFrame, out_png: Path) -> None:
     d = summary_df.copy()
 
     ax = axs[0, 0]
-    ax.scatter(d["raw_headway_mean"], d["gen_headway_mean"], c=np.where(d["all_ok"], "#2ca02c", "#d62728"))
+    ax.scatter(d["raw_headway_mean"], d["gen_headway_mean"], c=np.where(d["all_ok"], PASS_COLOR, FAIL_COLOR))
     lim = [
         min(d["raw_headway_mean"].min(), d["gen_headway_mean"].min()) * 0.95,
         max(d["raw_headway_mean"].max(), d["gen_headway_mean"].max()) * 1.05,
@@ -379,7 +384,7 @@ def _plot_fleet(summary_df: pd.DataFrame, out_png: Path) -> None:
     ax.grid(True, ls="--", alpha=0.3)
 
     ax = axs[0, 1]
-    ax.bar(d["driver_id"], d["gap_mean_ratio"] - 1.0, color=np.where(d["gap_mean_ok"], "#2ca02c", "#d62728"))
+    ax.bar(d["driver_id"], d["gap_mean_ratio"] - 1.0, color=np.where(d["gap_mean_ok"], PASS_COLOR, FAIL_COLOR))
     ax.axhline(0.0, color="k", lw=0.8)
     ax.set_ylabel("Gap mean ratio - 1")
     ax.set_title("Headway mean drift")
@@ -387,15 +392,15 @@ def _plot_fleet(summary_df: pd.DataFrame, out_png: Path) -> None:
     ax.grid(True, axis="y", ls="--", alpha=0.3)
 
     ax = axs[1, 0]
-    ax.bar(d["driver_id"], d["geom_gap_mae_m"], color=np.where(d["geometry_ok"], "#2ca02c", "#d62728"))
+    ax.bar(d["driver_id"], d["geom_gap_mae_m"], color=np.where(d["geometry_ok"], PASS_COLOR, FAIL_COLOR))
     ax.set_ylabel("Geometry gap MAE (m)")
     ax.set_title("Gap vs position consistency")
     ax.tick_params(axis="x", rotation=45)
     ax.grid(True, axis="y", ls="--", alpha=0.3)
 
     ax = axs[1, 1]
-    ax.bar(d["driver_id"], d["ttc_abnormal_frac"], alpha=0.7, label="TTC abnormal frac")
-    ax.bar(d["driver_id"], d["thw_abnormal_frac"], alpha=0.7, label="THW abnormal frac")
+    ax.bar(d["driver_id"], d["thw_abnormal_frac"], color=RAW_COLOR, alpha=0.75, label="THW abnormal frac")
+    ax.bar(d["driver_id"], d["ttc_abnormal_frac"], color=GEN_COLOR, alpha=0.75, label="TTC abnormal frac")
     ax.set_ylabel("Fraction")
     ax.set_title("Risk metric abnormal fraction (TTC informational)")
     ax.tick_params(axis="x", rotation=45)

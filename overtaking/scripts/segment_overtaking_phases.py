@@ -506,7 +506,7 @@ def save_phase_figure(
     ax_y.legend(
         handles=list(phase_patches) + h_y,
         labels=[p.get_label() for p in phase_patches] + lab_y,
-        loc="upper right",
+        loc="upper left",
         fontsize=7,
         ncol=2,
     )
@@ -526,7 +526,7 @@ def save_phase_figure(
     ax_st.legend(
         handles=list(phase_patches) + h_s,
         labels=[p.get_label() for p in phase_patches] + lab_s,
-        loc="upper right",
+        loc="upper left",
         fontsize=7,
         ncol=2,
     )
