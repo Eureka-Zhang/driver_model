@@ -79,6 +79,11 @@ CLUSTER_FEATURE_ROWS = (
         "越小越激进",
     ),
     ("dist_init", "开始变道抽出瞬间与前车的绝对距离", "越小越激进"),
+    (
+        "dist_return",
+        "开始回归原车道（P4）瞬间与前车的绝对距离（distance_headway，与 dist_init 同定义）",
+        "越小越激进",
+    ),
     ("a_lat_max", "变道过程中的最大横向加速度 (m/s2)", "越大越激进"),
     ("jerk_lat_max", "变道过程中的最大横向冲击度 (Jerk, m/s3)", "越大越激进"),
     ("v_diff_pass", "与前车并行时的平均超车速度差 (Δv)", "越大越激进"),
@@ -87,13 +92,19 @@ CLUSTER_FEATURE_ROWS = (
 
 CLUSTER_FEATURES = [r[0] for r in CLUSTER_FEATURE_ROWS]
 
-# Raw-feature scatter panels (2x2), same spirit as cluster_following_style raw_pairs
+# Raw-feature scatter panels (2x2): one pair per semantic group; all 7 dims appear at least once.
 OVERTAKING_RAW_PAIR_SPECS = (
     (
         ("ttc_init", "dist_init"),
         "TTC init (s)",
         "Dist init (m)",
-        "Start of LC: spacing",
+        "Start LC: safety margin",
+    ),
+    (
+        ("dist_init", "dist_return"),
+        "Dist init (m)",
+        "Dist return (m)",
+        "Spacing: start vs return",
     ),
     (
         ("a_lat_max", "jerk_lat_max"),
@@ -106,12 +117,6 @@ OVERTAKING_RAW_PAIR_SPECS = (
         "v diff pass (m/s)",
         "Duration (s)",
         "Pass timing",
-    ),
-    (
-        ("ttc_init", "t_duration"),
-        "TTC init (s)",
-        "Duration (s)",
-        "TTC vs duration",
     ),
 )
 
@@ -770,12 +775,25 @@ def _features_from_row_dicts(
     if ir_idx >= ile_h:
         return None, n
 
+    # P4 return-lane-change start: i_left_end (same headway column as dist_init)
+    if ile_h >= n:
+        return None, n
+    d_ret = dhs[ile_h]
+    if not _headway_distance_usable(d_ret):
+        for j in range(ile_h, min(ile_h + 6, n)):
+            if _headway_distance_usable(dhs[j]):
+                d_ret = dhs[j]
+                break
+    if not _headway_distance_usable(d_ret):
+        return None, n
+
     t_duration = float(times[-1]) - float(times[ie])
 
     return (
         {
             "ttc_init": float(tt0),
             "dist_init": float(d0),
+            "dist_return": float(d_ret),
             "a_lat_max": float(peak_a),
             "jerk_lat_max": float(peak_j),
             "v_diff_pass": v_diff_mean,
@@ -887,6 +905,7 @@ def _point_aggression_proxy(cluster_features, vec):
     return (
         -p["ttc_init"]
         - p["dist_init"]
+        - p["dist_return"]
         + p["a_lat_max"]
         + p["jerk_lat_max"]
         + p["v_diff_pass"]
@@ -1232,6 +1251,7 @@ def run_clustering_bundle(
                     "phase_merge = concat *__phase_MM_*.csv per clip; "
                     "ttc_init = distance_headway/(ego_speed-lead_speed) when (ego_speed-lead_speed)>1e-2 "
                     "(replay/DataCollector kinematics; not CSV ttc column); "
+                    "dist_init at i_follow_end, dist_return at i_left_end (P4 start); "
                     "t_duration = timestamp[last] - timestamp[i_follow_end]; "
                     "a_lat/jerk from central differences on ego_pos_y"
                 ),
@@ -1380,7 +1400,7 @@ def main():
     ap.add_argument(
         "--cluster_dim_weights",
         type=str,
-        default="1,1,1,1,1,1",
+        default="1,1,1,1,1,1,1",
         help="Weights for z-scored features (order {})".format(",".join(CLUSTER_FEATURES)),
     )
     ap.add_argument(
